@@ -1,8 +1,10 @@
 import os
+import argparse
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.fsdp import FSDPModule
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from models import MultiModalModel
 from fsdp_utils import apply_fsdp2
@@ -10,13 +12,23 @@ from fsdp_utils import apply_fsdp2
 os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--distributed-backend", type=str, default="gloo",
+                        help="分布式后端，CPU 环境下强制使用 gloo")
+    return parser.parse_args()
+
+
 def main():
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
+    args = parse_args()
+
+    # 强制使用 CPU
+    device = torch.device("cpu")
     torch.set_default_device(device)
 
+    # 始终初始化进程组（torchrun 会设置 RANK 环境变量）
     if "RANK" in os.environ:
-        backend = "nccl" if use_cuda else "gloo"
+        backend = "gloo"  # CPU 只能使用 gloo
         dist.init_process_group(backend=backend)
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -32,13 +44,15 @@ def main():
         vocab_size=1000, llm_dim=128, llm_depth=10, llm_heads=4,
         num_experts=36, top_k=8, max_seq_len=128
     )
-    print(f"Model param count: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"[Rank {rank}] Model param count: {sum(p.numel() for p in model.parameters()):,}")
 
     if world_size > 1:
-        mesh = DeviceMesh(device.type, torch.arange(world_size).tolist())
+        mesh = DeviceMesh("cpu", torch.arange(world_size).tolist())
         fsdp_model = apply_fsdp2(model, mesh)
+        print(f"[Rank {rank}] FSDP2 applied with mesh size {mesh.size()}")
     else:
-        fsdp_model = model
+        fsdp_model = DDP(model, device_ids=None)
+        print(f"[Rank {rank}] Using ordinary DDP")
 
     optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=1e-3)
 
@@ -56,15 +70,17 @@ def main():
         loss.backward()
         optimizer.step()
 
-    if world_size > 1 and isinstance(fsdp_model, FSDPModule):
-        #print("\n--- FSDP State Debug ---")
+    # 打印 FSDP 分片信息（单卡也能看到 FSDPModule 包装）
+    if isinstance(fsdp_model, FSDPModule):
+        print(f"\n[Rank {rank}] --- FSDP State Debug ---")
         for name, param in fsdp_model.named_parameters():
             if hasattr(param, '_local_tensor'):
                 local_shape = param._local_tensor.shape
                 global_shape = param.shape
-                print(f"  {name}: global={global_shape}, local={local_shape}")
+                print(f"  [Rank {rank}] {name}: global={global_shape}, local={local_shape}")
 
     if world_size > 1:
+        dist.barrier()
         dist.destroy_process_group()
 
 

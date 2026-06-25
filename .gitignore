@@ -1,0 +1,9 @@
+# 忽略pytorch源码
+pytorch-2.12.0/
+pytorch-*/
+
+# 忽略FSDP2临时源码副本
+fsdp2/_src/
+
+# IDE
+.vscode/

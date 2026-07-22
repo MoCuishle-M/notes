@@ -12,7 +12,7 @@ class TinyViT(nn.Module):
         self.patch_embed = nn.Conv2d(in_channels, embed_dim,
                                      kernel_size=patch_size, stride=patch_size)
         num_patches = (image_size // patch_size) ** 2
-        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(num_patches, embed_dim) * 0.02)
         self.blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, use_moe=False)
             for _ in range(depth)

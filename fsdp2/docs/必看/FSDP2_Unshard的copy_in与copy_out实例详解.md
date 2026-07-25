@@ -3,6 +3,7 @@
 > 配套文档：`FSDP2_fully_shard机制详解.md`、`FSDP2权重如何变成DTensor及内存生命周期.md`
 >
 > 源码：
+>
 > - `_fsdp_param.py`：单参数分片、`init_unsharded_param`、`to_unsharded`、`free_storage`
 > - `_fsdp_collectives.py`：`foreach_all_gather`（copy-in + NCCL）、`foreach_all_gather_copy_out`
 > - `_fsdp_param_group.py`：`unshard` / `wait_for_unshard` 编排
@@ -18,7 +19,7 @@
 为便于追踪，给每个 storage 命名：
 
 | storage 名 | 含义 | 大小 |
-|-----------|------|------|
+| ----------- | ------ | ------ |
 | **S1** | 本 rank 的分片（padded） | 0.5MB |
 | **S2** | all-gather 合并输出缓冲（整个 group 共用一个） | 2.0MB（临时） |
 | **S3** | 每个 param 自己的 `all_gather_outputs[0]`（全量） | 2.0MB |
@@ -30,7 +31,7 @@
 调用前每卡都有完整 `(512,1024)`。函数逐步执行：
 
 | 步骤 | 源码行 | 产生/赋值的变量 | 指向的 storage |
-|------|--------|-----------------|----------------|
+| ------ | -------- | ----------------- | ---------------- |
 | 构造 spec | `:497` | `_sharding_spec = DTensorSpec(mesh=(4,), placements=(Shard(0),), tensor_meta=(512,1024,f32))` | — (元数据) |
 | 记录全局形状 | `:276` | `_orig_size = (512,1024)`，`_contiguous_orig_stride` | — |
 | 切分 | `:294` | `chunks = _chunk_with_empty(param, 4, dim=0)` → 4 份 `(128,1024)` | 临时 |
@@ -52,7 +53,7 @@
 
 ### 初始化后 rank 0 内存
 
-```
+```text
 fc1.weight (DTensor) ─┐
                       ├─→ sharded_param._local_tensor (128,1024) ─┐
 fsdp_param._sharded_param_data (131072,) 1D ──────────────────────┴─→ S1 (0.5MB)
@@ -97,7 +98,7 @@ torch._foreach_copy_(foreach_copy_dsts, all_gather_inputs)            # S1 → S
 
 copy-in 后 S2 状态（rank 0 视角，只有 `[0:131072]` 有数据，其余待通信填充）：
 
-```
+```text
 S2: [rank0的128行 | 空 | 空 | 空 ]
 ```
 
@@ -149,7 +150,7 @@ self._unsharded_param = nn.Parameter(unsharded_param, requires_grad=...)        
 
 ### Unshard 完成后 rank 0 内存
 
-```
+```text
 fc1.weight = _unsharded_param (512,1024) ──→ S3 (2.0MB)   ← 完整参数，供 F.linear 计算
 fsdp_param.all_gather_outputs[0] (524288,) ─→ S3 (别名)
 fsdp_param.sharded_param (DTensor local 128,1024) ──→ S1 (0.5MB)   ← 分片仍在！
@@ -186,7 +187,7 @@ def free_storage(tensor: torch.Tensor) -> None:
 
 ### Reshard 后 rank 0 内存
 
-```
+```text
 fc1.weight = sharded_param (DTensor local 128,1024) ──→ S1 (0.5MB)
 fsdp_param._sharded_param_data (131072,) ──→ S1 (别名)
 fsdp_param.all_gather_outputs[0] (524288,) ──→ S3 但 storage.size()==0  ← 对象还在，显存已归还
@@ -211,7 +212,7 @@ def alloc_storage(tensor: torch.Tensor) -> None:     # :988
 ## 五、内存变量时间线总表（rank 0，单参数 group）
 
 | 时刻 | `fc1.weight` 指向 | 存活的 storage | 显存 |
-|------|-------------------|----------------|------|
+| ------ | ------------------- | ---------------- | ------ |
 | `fully_shard` 前 | 全量 (512,1024) | 原始全量 | 2.0MB |
 | 初始化切分后 | DTensor(local 128,1024)→S1 | S1(0.5) | 0.5MB |
 | **copy-in** 时 | DTensor→S1 | S1 + **S2**(2.0，正在填本rank槽) | 2.5MB |
@@ -228,7 +229,7 @@ def alloc_storage(tensor: torch.Tensor) -> None:     # :988
 
 当 `FSDPParamGroup` 含 `fc1.weight` 和 `fc2.weight` 两个参数时，copy-out 才真正体现"拆分"作用：
 
-```
+```text
 copy-in 阶段：
   S2 = [fc1_rank0 | fc2_rank0 | 空 | 空 | 空 | 空 | 空 | 空]
        (按 inp_split_sizes 把本rank的 fc1分片、fc2分片 依次填进 S2 的本rank槽)
@@ -278,7 +279,7 @@ for fsdp_param, param_all_gather_outputs in shard_i_copy_infos:
 ### 3. unshard 创建了什么变量？
 
 | 变量 | 类型 | 生命周期 |
-|------|------|----------|
+| ------ | ------ | ---------- |
 | `all_gather_output` (S2) | 合并缓冲 | copy-in 到 copy-out，之后释放 |
 | `all_gather_outputs[0]` (S3) | 每 param 一个全量缓冲 | unshard 创建，reshard 时 storage 缩 0 但对象保留 |
 | `_unsharded_param` | Parameter，`as_strided` 视图 S3 | 首次 unshard 创建，对象永久保留，storage 动态伸缩 |

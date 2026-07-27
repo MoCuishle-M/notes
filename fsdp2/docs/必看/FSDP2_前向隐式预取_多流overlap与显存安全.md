@@ -1,6 +1,6 @@
 # FSDP2：前向隐式预取的多流 overlap 与显存安全
 
-> 配套文档：`FSDP2_Unshard的copy_in与copy_out实例详解.md`、`前向预取.md`、`FSDP2_fully_shard机制详解.md`
+> 配套文档：`FSDP2_Unshard的copy_in与copy_out实例详解.md`、`前向预取.md`、`FSDP2_fully_shard机制详解.md`、`FSDP2_反向预取_多流overlap与显存安全.md`
 >
 > 源码：
 > - `_fsdp_param_group.py`：`FSDPCommContext.lazy_init`、`get_all_gather_streams`、`unshard` / `wait_for_unshard`、`AllGatherState`
@@ -48,13 +48,13 @@ reference to avoid holding onto memory after forward.
 ```python
 def get_all_gather_streams(self, async_op, training_state):
     if not async_op and training_state in (FORWARD, PRE_BACKWARD):
-        # 隐式预取：copy-in 和 all-gather 分别用独立 stream，才能 overlap
+        # async_op=False 且前向/反向预取：copy-in 和 all-gather 分别用独立 stream，才能 overlap
         return self.all_gather_copy_in_stream, self.all_gather_stream
     current_stream = self.device_handle.current_stream()
-    return current_stream, current_stream   # 显式预取/反向：同一条 stream
+    return current_stream, current_stream   # async_op=True：同一条 stream（用 overlap 换避免多流显存碎片）
 ```
 
-只有**前向 + `async_op=False`（默认）** 才用 `all_gather_copy_in_stream` 和 `all_gather_stream` 两条独立 stream，这是隐式预取 overlap 的前提。其他情况（显式预取或反向）两条返回的都是 `current_stream`（计算流），即 copy-in 和 all-gather 串行排在同一条计算流上，不做 overlap。
+只要 **`async_op=False`（默认）且 `training_state ∈ {FORWARD, PRE_BACKWARD}`**，就返回 `all_gather_copy_in_stream` 和 `all_gather_stream` 两条独立 stream——这涵盖前向（`FORWARD`）和反向预取（`PRE_BACKWARD`）。只有当用户主动设置 `unshard_async_op=True` 时（`_fully_shard.py:694-711`），`async_op` 才为 True，两条返回的都是 `current_stream`（计算流），copy-in 和 all-gather 串行排在同一条计算流上——这是用 overlap 换取避免多流显存碎片的权衡，需配合显式预取使用。
 
 ### 3. 一次 unshard 在 stream 上的三步展开
 
@@ -253,7 +253,7 @@ def _wait_all_gather_streams_on_event(self, event: torch.Event | None):
 
 参数组1 是最后一个参数组，后面没有下一个参数组来替它清 `all_gather_state`。如果不 flush，输出缓冲1 这块 unsharded 缓冲会一直挂到下一次前向才开始，白白占显存。所以前向收尾时由最后一个参数组把 `all_gather_state` 清掉（对应时序图末"末尾 flush"），释放输出缓冲1。
 
-> 反向不走这条路：`get_all_gather_streams` 在反向返回 `(current_stream, current_stream)`，走 `else` 分支立即 `wait(copy-out 完成事件)`，不延迟释放，也不写 `all_gather_state`。延迟释放仅在前向隐式预取时发生。
+> 反向不走延迟释放这条路：延迟释放的条件是 `not async_op AND training_state == FORWARD AND world_size > 1`（`_fsdp_param_group.py:441-444`），反向的 `training_state` 是 `PRE_BACKWARD`，不满足条件，走 `else` 分支立即 `wait(copy-out 完成事件)`，不写 `all_gather_state`。但反向**仍然使用独立流**（`PRE_BACKWARD` 在 `get_all_gather_streams` 的条件中），只是不需要延迟释放——因为反向的 overlap 对象是 reduce-scatter（不同流、不同缓冲），而非下一个 all-gather（同类型缓冲），无显存安全问题。详见配套文档 `FSDP2_反向预取_多流overlap与显存安全.md`。
 
 ---
 

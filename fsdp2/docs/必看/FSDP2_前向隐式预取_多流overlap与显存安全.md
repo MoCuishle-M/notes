@@ -6,7 +6,7 @@
 > - `_fsdp_param_group.py`：`FSDPCommContext.lazy_init`、`get_all_gather_streams`、`unshard` / `wait_for_unshard`、`AllGatherState`
 > - `_fsdp_collectives.py`：`foreach_all_gather`（copy-in + all-gather 集体通信）、`foreach_all_gather_copy_out`
 >
-> 本文解读 `_fsdp_param_group.py:57-66` 的 `[Note: Overlapping all-gather copy-in and all-gather]`，并用一个**具体例子 + 从左到右的三流时序图**说明 overlap 如何达成、显存如何安全。
+> 本文解读 `_fsdp_param_group.py` 中 `[Note: Overlapping all-gather copy-in and all-gather]`（源码顶部注释），并用一个**具体例子 + 从左到右的三流时序图**说明 overlap 如何达成、显存如何安全。
 
 ---
 
@@ -29,7 +29,7 @@ reference to avoid holding onto memory after forward.
 
 ### 1. 五条 GPU stream
 
-`FSDPCommContext.lazy_init`（`_fsdp_param_group.py:72-100`）创建了四条显式 stream，加上默认的计算流，FSDP2 共使用五条 GPU stream。下表列出全部五条 stream 的全称与作用：
+`FSDPCommContext.lazy_init`（`_fsdp_param_group.py:40-78`）创建了四条显式 stream，加上默认的计算流，FSDP2 共使用五条 GPU stream。下表列出全部五条 stream 的全称与作用：
 
 | stream 字段名 | 优先级 | 作用 |
 | ------ | ------ | ------ |
@@ -43,7 +43,7 @@ reference to avoid holding onto memory after forward.
 
 ### 2. 关键：前向隐式预取走两条独立 stream
 
-`get_all_gather_streams`（`_fsdp_param_group.py:102-112`）：
+`get_all_gather_streams`（`_fsdp_param_group.py:80-90`）：
 
 ```python
 def get_all_gather_streams(self, async_op, training_state):
@@ -54,24 +54,24 @@ def get_all_gather_streams(self, async_op, training_state):
     return current_stream, current_stream   # async_op=True：同一条 stream（用 overlap 换避免多流显存碎片）
 ```
 
-只要 **`async_op=False`（默认）且 `training_state ∈ {FORWARD, PRE_BACKWARD}`**，就返回 `all_gather_copy_in_stream` 和 `all_gather_stream` 两条独立 stream——这涵盖前向（`FORWARD`）和反向预取（`PRE_BACKWARD`）。只有当用户主动设置 `unshard_async_op=True` 时（`_fully_shard.py:694-711`），`async_op` 才为 True，两条返回的都是 `current_stream`（计算流），copy-in 和 all-gather 串行排在同一条计算流上——这是用 overlap 换取避免多流显存碎片的权衡，需配合显式预取使用。
+只要 **`async_op=False`（默认）且 `training_state ∈ {FORWARD, PRE_BACKWARD}`**，就返回 `all_gather_copy_in_stream` 和 `all_gather_stream` 两条独立 stream——这涵盖前向（`FORWARD`）和反向预取（`PRE_BACKWARD`）。只有当用户主动设置 `unshard_async_op=True` 时（`_fully_shard.py` 中 `set_unshard_async_op`），`async_op` 才为 True，两条返回的都是 `current_stream`（计算流），copy-in 和 all-gather 串行排在同一条计算流上——这是用 overlap 换取避免多流显存碎片的权衡，需配合显式预取使用。
 
 ### 3. 一次 unshard 在 stream 上的三步展开
 
-`foreach_all_gather`（`_fsdp_collectives.py:324-378`）把 unshard 的前两步编排到 stream 上：
+`foreach_all_gather`（`_fsdp_collectives.py:323-372`）把 unshard 的前两步编排到 stream 上：
 
 ```text
 all-gather copy-in 流:  copy 参数分片 → all-gather输出缓冲[本rank的view]   # 注意：input 是 output 的 view！
-all-gather 流:          wait(all-gather copy-in流); all-gather(输出缓冲); 记录 all-gather完成事件
+all-gather 流:          wait_stream(all-gather copy-in流); all-gather(输出缓冲); 记录 all-gather完成事件
 ```
 
-随后 `wait_for_unshard`（`_fsdp_param_group.py:381-454`）在计算流上执行第三步：
+随后 `wait_for_unshard`（`_fsdp_param_group.py:348-430`）在计算流上执行第三步：
 
 ```text
-计算流:                  wait(all-gather完成事件); copy-out(输出缓冲 → 参数); 记录 copy-out完成事件
+计算流:                  wait_event(all-gather完成事件); copy-out(输出缓冲 → 参数); 记录 copy-out完成事件
 ```
 
-**重点**：`_fsdp_collectives.py:354` 调用的 `torch.ops.fsdp.all_gather_copy_in(...)` 返回的 `all_gather_input` 不是新内存，而是 **all-gather 输出缓冲里本 rank 那一段的 view**（`_fsdp_collectives.py:270-272` 的 `all_gather_output.narrow(...)`）。也就是说 copy-in 写入的内存 == all-gather 即将读/写的输出缓冲本身。这一点是后面显存安全的根源。
+**重点**：`_fsdp_collectives.py:346` 调用的 `torch.ops.fsdp.all_gather_copy_in(...)` 返回的 `all_gather_input` 不是新内存，而是 **all-gather 输出缓冲里本 rank 那一段的 view**（`_fsdp_collectives.py:267-269` 的 `all_gather_output.narrow(...)`）。也就是说 copy-in 写入的内存 == all-gather 即将读/写的输出缓冲本身。这一点是后面显存安全的根源。
 
 ---
 
@@ -89,7 +89,7 @@ all-gather 流:          wait(all-gather copy-in流); all-gather(输出缓冲); 
 block0.pre_forward → block0.forward → block1.pre_forward → block1.forward → ...
 ```
 
-其中 `pre_forward`（`_fsdp_param_group.py:475-484`）内部依次调用 `unshard()` + `wait_for_unshard()`。
+其中 `pre_forward`（`_fsdp_param_group.py:443-452`）内部依次调用 `unshard()` + `wait_for_unshard()`。
 
 ### 2. 记号说明
 
@@ -119,62 +119,63 @@ block0.pre_forward → block0.forward → block1.pre_forward → block1.forward 
 
 ## 三、从左到右的三流时序图（前向）
 
-下图时间轴**从左到右**流动，三条 stream 各占一行。箭头 `↓ wait` 表示下游 stream 等待上游 stream 完成（通过 `wait_stream` 或 `wait_event` 实现）。
+下图时间轴**从左到右**流动，三条 stream 各占一行。为清晰起见，同步原语做如下约定：
+
+- `wait_stream(A→B)`：B 流等待 A 流完成（`B.wait_stream(A)`）。
+- `wait_event(E)`：当前流等待事件 E 发生（`stream.wait_event(E)`）。
+- `[E]`：在当前流上记录事件 E（`stream.record_event()`）。
 
 ```text
 时间 ──────────────────────────────────────────────────────────────────────────────────────────→
 
-                ┌─ copy-in ──────┐  ┌─ copy-in ──────┐
-all-gather      │ copy 参数分片0 │  │ copy 参数分片1 │  后续排入 wait(copy-out完成事件0)
-copy-in 流      │ → 输出缓冲0    │  │ → 输出缓冲1    │  约束后续对输出缓冲0 内存的复用
-                │ (参数组0)      │  │ (参数组1)      │
-                └───────┬────────┘  └───────┬────────┘
-                        │ wait               │ wait
-                        ↓                    ↓
-all-gather              ┌─ all-gather ──┐    ┌─ all-gather ──┐
-流                      │ (输出缓冲0)    │    │ (输出缓冲1)    │  后续排入 wait(copy-out完成事件0)
-                        │ record         │    │ record         │
-                        │ all-gather     │    │ all-gather     │
-                        │ 完成事件0      │    │ 完成事件1      │
-                        └───────┬────────┘    └───────┬────────┘
-                                │ wait               │ wait
-                                ↓                    ↓
-计算流                          ┌─ copy-out ────┐  ┌─ block0 ──┐  ┌─ copy-out ────┐  ┌─ block1 ──┐
+                ┌─ copy-in0 ─────┐  ┌─ copy-in1 ─────┐
+all-gather      │ copy 参数分片0 │  │ copy 参数分片1 │  wait_event(copy-out-event0)
+copy-in 流      │ → 输出缓冲0    │  │ → 输出缓冲1    │  │ 约束后续复用输出缓冲0 的内存
+                │ (参数组0)      │  │ (参数组1)      │  │
+                └───────┬────────┘  └───────┬────────┘  └──────────────────────────────
+                        │ wait_stream       │ wait_stream
+                        ↓ (copy-in→all-gather)↓ (copy-in→all-gather)
+all-gather              ┌─ all-gather0 ──┐    ┌─ all-gather1 ──┐
+流                      │ (输出缓冲0)     │    │ (输出缓冲1)     │  wait_event(copy-out-event0)
+                        │ [AG-event0]    │    │ [AG-event1]    │  │ 约束后续复用输出缓冲0 的内存
+                        └───────┬────────┘    └───────┬────────┘  └──────────────────────────────
+                                │ wait_event        │ wait_event
+                                ↓ (AG-event0)       ↓ (AG-event1)
+计算流                          ┌─ copy-out0 ────┐  ┌─ block0 ──┐  ┌─ copy-out1 ────┐  ┌─ block1 ──┐
                                 │ 输出缓冲0      │  │  算子     │  │ 输出缓冲1      │  │  算子     │
                                 │ → 参数0        │  │ (matmul等)│  │ → 参数1        │  │ (matmul等)│
-                                │ record         │  │           │  │ record         │  │           │
-                                │ copy-out       │  │           │  │ copy-out       │  │           │
-                                │ 完成事件0      │  │           │  │ 完成事件1      │  │           │
+                                │ [CO-event0]    │  │           │  │ [CO-event1]    │  │           │
                                 └────────────────┘  └───────────┘  └────────────────┘  └───────────┘
 
          ◄──── overlap 1 ────►              ◄────────── overlap 2 ──────────►
-         copy-in(参数分片1)                  all-gather(输出缓冲1)
-         ∥ all-gather(输出缓冲0)              ∥ copy-out(输出缓冲0→参数0) + block0 算子
+         copy-in1(参数分片1→输出缓冲1)
+         ∥ all-gather0(输出缓冲0)              all-gather1(输出缓冲1)
+                                                 ∥ copy-out0(输出缓冲0→参数0) + block0 算子
 ```
 
 ### 图中发生的事情，逐步说明
 
-1. **参数组0 的 copy-in**（all-gather copy-in 流）：`foreach_all_gather` 在 all-gather copy-in 流上分配输出缓冲0，并将本 rank 的参数分片0 拷贝到输出缓冲0 中本 rank 对应的 view 段。由于 all-gather 的 input 是 output 的 view，这一步实际上是在写输出缓冲0 本身。
+1. **参数组0 的 copy-in**（all-gather copy-in 流）：`foreach_all_gather` 在 `all_gather_copy_in_stream` 上分配输出缓冲0，并将本 rank 的参数分片0 拷贝到输出缓冲0 中本 rank 对应的 view 段。由于 all-gather 的 input 是 output 的 view，这一步实际上是在写输出缓冲0 本身。
 
-2. **参数组0 的 all-gather**（all-gather 流）：all-gather 流通过 `wait_stream(all_gather_copy_in_stream)`（`_fsdp_collectives.py:362`）等待 copy-in 完成后，执行 all-gather 集体通信，将各 rank 的分片汇聚到输出缓冲0。完成后记录 all-gather 完成事件0。
+2. **参数组0 的 all-gather**（all-gather 流）：`all_gather_stream` 通过 `wait_stream(all_gather_copy_in_stream)`（`_fsdp_collectives.py:355`）等待 copy-in0 完成后，执行 all-gather0，将各 rank 的分片汇聚到输出缓冲0。完成后在 `all_gather_stream` 上记录 **all-gather 完成事件0**（`AG-event0`）。
 
-3. **参数组1 的 copy-in**（all-gather copy-in 流）：参数组0 的 copy-in 一完成，all-gather copy-in 流立即接上参数组1 的 copy-in——分配输出缓冲1（此时输出缓冲0 仍被 `all_gather_state` 持有，allocator 不会复用它的内存，所以输出缓冲1 ≠ 输出缓冲0），将参数分片1 拷贝到输出缓冲1。**这一步与参数组0 的 all-gather 并行**——这就是 overlap 1。
+3. **参数组1 的 copy-in**（all-gather copy-in 流）：copy-in0 一完成，`all_gather_copy_in_stream` 立即接上 copy-in1——分配输出缓冲1（此时输出缓冲0 仍被 `all_gather_state` 持有，allocator 不会复用它的内存，所以输出缓冲1 ≠ 输出缓冲0），将参数分片1 拷贝到输出缓冲1。**copy-in1 与 all-gather0 并行**——这就是 **overlap 1**。
 
-4. **参数组0 的 copy-out + block0 算子**（计算流）：计算流通过 `wait_event(all-gather 完成事件0)` 等待 all-gather 完成后，执行 copy-out（输出缓冲0 → 参数0），记录 copy-out 完成事件0，然后执行 block0 的前向算子（matmul 等）。
+4. **参数组0 的 copy-out + block0 算子**（计算流）：`current_stream` 通过 `wait_event(AG-event0)` 等待 all-gather0 完成后，执行 copy-out0（输出缓冲0 → 参数0），记录 **copy-out 完成事件0**（`CO-event0`），然后执行 block0 的前向算子（matmul 等）。
 
-5. **参数组1 的 all-gather**（all-gather 流）：参数组1 的 copy-in 完成后，all-gather 流执行参数组1 的 all-gather 集体通信，记录 all-gather 完成事件1。**这一步与 block0 算子并行**——这就是 overlap 2。
+5. **参数组1 的 all-gather**（all-gather 流）：copy-in1 完成后，`all_gather_stream` 执行 all-gather1，记录 `AG-event1`。**all-gather1 与 block0 算子并行**——这就是 **overlap 2**。
 
-6. **参数组1 的 copy-out + block1 算子**（计算流）：block0 算子完成后，计算流等待 all-gather 完成事件1，执行 copy-out（输出缓冲1 → 参数1），记录 copy-out 完成事件1，然后执行 block1 的前向算子。
+6. **参数组1 的 copy-out + block1 算子**（计算流）：block0 算子完成后，`current_stream` 等待 `AG-event1`，执行 copy-out1（输出缓冲1 → 参数1），记录 `CO-event1`，然后执行 block1 的前向算子。
 
-7. **延迟释放时机**：在参数组1 的 `wait_for_unshard` 开头（`_fsdp_param_group.py:393-396`），清除 `comm_ctx.all_gather_state`，释放对输出缓冲0 的引用。此时参数组1 的 copy-in 已经入队、输出缓冲1 已经分配好，所以释放输出缓冲0 不会导致 allocator 把同一块内存分给输出缓冲1。同时 `_wait_all_gather_streams_on_event`（`_fsdp_param_group.py:456-461`）在 all-gather copy-in 流和 all-gather 流末尾排入 `wait(copy-out 完成事件0)`，保证后续任何复用输出缓冲0 内存的操作必须等 copy-out 完成事件0 读完后才能执行。
+7. **延迟释放 + 插入后续等待**：在参数组1 的 `wait_for_unshard` 开头（`_fsdp_param_group.py:360-363`），先清除 `comm_ctx.all_gather_state`，释放对输出缓冲0 的引用。此时 copy-in1 已经入队、输出缓冲1 已经分配好，所以释放输出缓冲0 不会导致 allocator 把同一块内存分给输出缓冲1。随后 `_wait_all_gather_streams_on_event`（`_fsdp_param_group.py:423-428`）在 `all_gather_copy_in_stream` 和 `all_gather_stream` 的末尾排入 `wait_event(CO-event0)`，保证**后续**任何复用输出缓冲0 内存的操作必须等 copy-out0 读完后才能执行。
 
-8. **末尾 flush**：参数组1 是最后一个参数组，后面没有"下一个参数组"来替它清 `all_gather_state`。如果不 flush，输出缓冲1 这块 unsharded 缓冲会一直挂到下一次前向才开始，白白占显存。所以前向收尾时由最后一个参数组把 `all_gather_state` 清掉，释放输出缓冲1。
+8. **末尾 flush**：参数组1 是最后一个参数组，后面没有"下一个参数组"来替它清 `all_gather_state`。如果不 flush，输出缓冲1 这块 unsharded 缓冲会一直挂到下一次前向才开始，白白占显存。因此前向收尾时由 **root FSDPState 的 `_post_forward`**（`_fsdp_state.py:315-324`）检查并清空 `comm_ctx.all_gather_state`，释放输出缓冲1。
 
 ### overlap 在哪里？
 
 1. **copy-in(参数分片1)（all-gather copy-in 流） ∥ all-gather(输出缓冲0)（all-gather 流）**：all-gather copy-in 流和 all-gather 流是两条独立 stream。参数组0 的 copy-in 一完成，all-gather copy-in 流立刻接参数组1 的 copy-in，all-gather 流同时开始参数组0 的 all-gather。→ 这就是 Note 说的 "overlap the next copy-in with the current all-gather"。
 
-2. **all-gather(输出缓冲1)（all-gather 流） ∥ block0 算子（计算流）**：参数组0 的 copy-out 完成后计算流跑 block0 算子，all-gather 流上参数组1 的 all-gather 同时进行。→ `wait_for_unshard` docstring（`_fsdp_param_group.py:382-385`）说的 "overlap the current copy-out with the next all-gather"。
+2. **all-gather1(输出缓冲1)（all-gather 流） ∥ block0 算子（计算流）**：copy-out0 完成后计算流跑 block0 算子，`all_gather_stream` 上参数组1 的 all-gather1 同时进行。→ `wait_for_unshard` docstring（`_fsdp_param_group.py:349-356`）说的 "overlap the current copy-out with the next all-gather"。
 
 ---
 
@@ -187,15 +188,15 @@ all-gather              ┌─ all-gather ──┐    ┌─ all-gather ──�
 - **current all-gather** = 参数组0 的 all-gather（all-gather 流上 `all-gather(输出缓冲0)`）
 - **next copy-in** = 参数组1 的 copy-in（all-gather copy-in 流上 `copy 参数分片1 → 输出缓冲1`）
 
-因为 all-gather copy-in 流和 all-gather 流是两条独立 stream，参数组0 的 copy-in 一完成，all-gather copy-in 流立刻接参数组1 的 copy-in，而 all-gather 流同时开始参数组0 的 all-gather。两者**并行**。这就是 `get_all_gather_streams` 在前向返回两条独立 stream 的目的（`_fsdp_param_group.py:105-110`）。
+因为 all-gather copy-in 流和 all-gather 流是两条独立 stream，参数组0 的 copy-in 一完成，all-gather copy-in 流立刻接参数组1 的 copy-in，而 all-gather 流同时开始参数组0 的 all-gather。两者**并行**。这就是 `get_all_gather_streams` 在前向返回两条独立 stream 的目的（`_fsdp_param_group.py:83-88`）。
 
 ### ② "all-gather input as a view into the output"
 
-`foreach_all_gather` 里 `_fsdp_collectives.py:354` 调用 `torch.ops.fsdp.all_gather_copy_in(...)`，其实现（`_fsdp_collectives.py:270-272`）通过 `all_gather_output.narrow(0, all_gather_input_numel * rank, all_gather_input_numel)` 返回 `all_gather_input`——它不是新内存，而是 **all-gather 输出缓冲里本 rank 那一段的 view**。也就是说 copy-in 写入的内存 == all-gather 即将读/写的输出缓冲本身。
+`foreach_all_gather` 里 `_fsdp_collectives.py:346` 调用 `torch.ops.fsdp.all_gather_copy_in(...)`，其实现（`_fsdp_collectives.py:267-269`）通过 `all_gather_output.narrow(0, all_gather_input_numel * rank, all_gather_input_numel)` 返回 `all_gather_input`——它不是新内存，而是 **all-gather 输出缓冲里本 rank 那一段的 view**。也就是说 copy-in 写入的内存 == all-gather 即将读/写的输出缓冲本身。
 
 ### ③ "must copy into different memory from the current all-gather's output"
 
-**危险场景**：如果输出缓冲0 在参数组1 的 copy-in 之前就被释放掉，那么 caching allocator 在参数组1 的 `all_gather_comm.allocate(...)`（`_fsdp_collectives.py:351`）时，**很可能把同一块物理显存分给输出缓冲1**。于是：
+**危险场景**：如果输出缓冲0 在参数组1 的 copy-in 之前就被释放掉，那么 caching allocator 在参数组1 的 `all_gather_comm.allocate(...)`（`_fsdp_collectives.py:344`）时，**很可能把同一块物理显存分给输出缓冲1**。于是：
 
 - all-gather copy-in 流上参数组1 的 copy-in 正在写输出缓冲1（== 输出缓冲0 那块内存）；
 - all-gather 流上参数组0 的 all-gather 可能还没写完输出缓冲0。
@@ -204,10 +205,10 @@ all-gather              ┌─ all-gather ──┐    ┌─ all-gather ──�
 
 ### ④ "keep a reference to the current all-gather's output … have the next group free it after its copy-in"
 
-**解决办法**（`wait_for_unshard`，`_fsdp_param_group.py:441-454`）：参数组0 的 copy-out 完成后**不立刻释放输出缓冲0**，而是把 `(AllGatherResult, copy-out 完成事件)` 存到全局 `comm_ctx.all_gather_state`：
+**解决办法**（`wait_for_unshard`，`_fsdp_param_group.py:408-417`）：参数组0 的 copy-out 完成后**不立刻释放输出缓冲0**，而是把 `(AllGatherResult, copy-out 完成事件)` 存到全局 `comm_ctx.all_gather_state`：
 
 ```python
-# _fsdp_param_group.py:441-450
+# _fsdp_param_group.py:408-417
 if (
     not async_op
     and self._training_state == TrainingState.FORWARD
@@ -226,7 +227,7 @@ self._all_gather_result = None  # free unless saved in `all_gather_state`
 
 只要这个引用还在，allocator 就**不会把输出缓冲0 的内存分给输出缓冲1**，保证输出缓冲1 ≠ 输出缓冲0 → 安全 overlap。
 
-等到参数组1 的 `wait_for_unshard`（`_fsdp_param_group.py:393-396`）：
+等到参数组1 的 `wait_for_unshard`（`_fsdp_param_group.py:360-363`）：
 
 ```python
 if self._training_state == TrainingState.FORWARD:  # implicit prefetch
@@ -235,9 +236,9 @@ if self._training_state == TrainingState.FORWARD:  # implicit prefetch
         self.comm_ctx.all_gather_state = None  # free the all-gather result
 ```
 
-**关键**：这个清除发生在参数组1 的 `unshard()` **之后**（`pre_forward` 里先 `unshard` 再 `wait_for_unshard`，`_fsdp_param_group.py:481-482`）。也就是说，参数组1 的 copy-in 已经入队、输出缓冲1 已经分配好之后，才丢掉输出缓冲0 引用。
+**关键**：这个清除发生在参数组1 的 `unshard()` **之后**（`pre_forward` 里先 `unshard` 再 `wait_for_unshard`，`_fsdp_param_group.py:449-450`）。也就是说，参数组1 的 copy-in 已经入队、输出缓冲1 已经分配好之后，才丢掉输出缓冲0 引用。
 
-同时 `_wait_all_gather_streams_on_event`（`_fsdp_param_group.py:456-461`）在 all-gather copy-in 流和 all-gather 流末尾排一个 `wait(copy-out 完成事件0)`，保证之后任何复用输出缓冲0 内存的操作必须等参数组0 的 copy-out 读完：
+同时 `_wait_all_gather_streams_on_event`（`_fsdp_param_group.py:423-428`）在 all-gather copy-in 流和 all-gather 流末尾排一个 `wait_event(CO-event0)`，保证之后任何复用输出缓冲0 内存的操作必须等参数组0 的 copy-out 读完：
 
 ```python
 def _wait_all_gather_streams_on_event(self, event: torch.Event | None):
@@ -251,9 +252,9 @@ def _wait_all_gather_streams_on_event(self, event: torch.Event | None):
 
 ### ⑤ "the last FSDP state flush the reference to avoid holding onto memory after forward"
 
-参数组1 是最后一个参数组，后面没有下一个参数组来替它清 `all_gather_state`。如果不 flush，输出缓冲1 这块 unsharded 缓冲会一直挂到下一次前向才开始，白白占显存。所以前向收尾时由最后一个参数组把 `all_gather_state` 清掉（对应时序图末"末尾 flush"），释放输出缓冲1。
+参数组1 是最后一个参数组，后面没有下一个参数组来替它清 `all_gather_state`。如果不 flush，输出缓冲1 这块 unsharded 缓冲会一直挂到下一次前向才开始，白白占显存。因此前向收尾时由 **root FSDPState 的 `_post_forward`**（`_fsdp_state.py:315-324`）检查并清空 `comm_ctx.all_gather_state`，释放输出缓冲1。
 
-> 反向不走延迟释放这条路：延迟释放的条件是 `not async_op AND training_state == FORWARD AND world_size > 1`（`_fsdp_param_group.py:441-444`），反向的 `training_state` 是 `PRE_BACKWARD`，不满足条件，走 `else` 分支立即 `wait(copy-out 完成事件)`，不写 `all_gather_state`。但反向**仍然使用独立流**（`PRE_BACKWARD` 在 `get_all_gather_streams` 的条件中），只是不需要延迟释放——因为反向的 overlap 对象是 reduce-scatter（不同流、不同缓冲），而非下一个 all-gather（同类型缓冲），无显存安全问题。详见配套文档 `FSDP2_反向预取_多流overlap与显存安全.md`。
+> 反向不走延迟释放这条路：延迟释放的条件是 `not async_op AND training_state == FORWARD AND world_size > 1`（`_fsdp_param_group.py:408-411`），反向的 `training_state` 是 `PRE_BACKWARD`，不满足条件，走 `else` 分支立即 `wait_event(copy-out 完成事件)`，不写 `all_gather_state`。但反向**仍然使用独立流**（`PRE_BACKWARD` 在 `get_all_gather_streams` 的条件中），只是不需要延迟释放——因为反向的 overlap 对象是 reduce-scatter（不同流、不同缓冲），而非下一个 all-gather（同类型缓冲），无显存安全问题。详见配套文档 `FSDP2_反向预取_多流overlap与显存安全.md`。
 
 ---
 
@@ -293,17 +294,18 @@ all-gather                  █████████████████�
 
 | 关注点 | 位置 |
 | -------- | ------ |
-| 创建 all-gather copy-in 流 / all-gather 流（高优先级） | `_fsdp_param_group.py:81-86`（`FSDPCommContext.lazy_init`） |
-| 创建 reduce-scatter 流 / all-reduce 流 | `_fsdp_param_group.py:89-93`（`FSDPCommContext.lazy_init`） |
-| 前向返回两条独立 stream | `_fsdp_param_group.py:102-112`（`get_all_gather_streams`） |
-| copy-in 写入 all-gather 输出缓冲的 view | `_fsdp_collectives.py:354`（`all_gather_copy_in`） |
-| all-gather 输出缓冲的 view 实现 | `_fsdp_collectives.py:270-272`（`all_gather_output.narrow`） |
-| all-gather 流等 all-gather copy-in 流 | `_fsdp_collectives.py:362`（`all_gather_stream.wait_stream`） |
-| copy-in → all-gather → copy-out 编排 | `_fsdp_param_group.py:337-454`（`unshard` / `wait_for_unshard`） |
-| 延迟释放：存 all-gather state | `_fsdp_param_group.py:441-450` |
-| 下一个参数组释放上一个输出缓冲 | `_fsdp_param_group.py:393-396` |
-| all-gather copy-in 流 / all-gather 流排 wait(copy-out 完成事件) | `_fsdp_param_group.py:456-461`（`_wait_all_gather_streams_on_event`） |
+| 创建 all-gather copy-in 流 / all-gather 流（高优先级） | `_fsdp_param_group.py:71-81`（`FSDPCommContext.lazy_init`） |
+| 创建 reduce-scatter 流 / all-reduce 流 | `_fsdp_param_group.py:82-92`（`FSDPCommContext.lazy_init`） |
+| 前向返回两条独立 stream | `_fsdp_param_group.py:80-90`（`get_all_gather_streams`） |
+| copy-in 写入 all-gather 输出缓冲的 view | `_fsdp_collectives.py:346`（`all_gather_copy_in`） |
+| all-gather 输出缓冲的 view 实现 | `_fsdp_collectives.py:267-269`（`all_gather_output.narrow`） |
+| all-gather 流等 all-gather copy-in 流 | `_fsdp_collectives.py:355`（`all_gather_stream.wait_stream`） |
+| copy-in → all-gather → copy-out 编排 | `_fsdp_param_group.py:314-430`（`unshard` / `wait_for_unshard`） |
+| 延迟释放：存 all-gather state | `_fsdp_param_group.py:408-417` |
+| 下一个参数组释放上一个输出缓冲 | `_fsdp_param_group.py:360-363` |
+| all-gather copy-in 流 / all-gather 流排 wait(copy-out 完成事件) | `_fsdp_param_group.py:423-428`（`_wait_all_gather_streams_on_event`） |
 | AllGatherState 定义 | `_fsdp_param_group.py:116-118` |
+| 末尾 flush `all_gather_state` | `_fsdp_state.py:315-324`（`_post_forward`） |
 
 ---
 

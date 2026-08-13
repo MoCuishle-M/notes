@@ -448,15 +448,227 @@ class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):
 
 对比重入：前向 `no_grad` 不建图，`CheckpointFunction.backward` 里 `enable_grad` 重跑出一张新图，然后 `torch.autograd.backward(outputs)` 在引擎里**开一段新的反向**——这才是"重入"。
 
-### 5.9 嵌套 checkpoint 的两条规则
+### 5.9 嵌套 checkpoint 的语义
 
-`checkpoint.py:626-655` 的 NOTE 说明了嵌套语义：
+`checkpoint.py:626-655` 的 NOTE 说明了嵌套语义。当 checkpoint 区域内又调用了 checkpoint（两层或更多层嵌套）时，需要搞清楚：前向时哪些张量由哪层管理？反向重算时各层之间如何联动？
 
-- **Rule 1**：被保存的张量只由**最内层** checkpoint 管理，对外层不可见。
-- **Rule 2**：内层 checkpoint 的输入，被视为"保存到父 checkpoint 的张量"。
-- **推论**：要重算某个张量，必须重算包裹它的所有层 checkpoint。
+#### 5.9.1 一个嵌套的例子
 
-代码上靠 `save_inputs` 用 `_make_saved_tensor`（`checkpoint.py:828`）实现：输入以 `SavedTensor` 形式存进 frame，`get_inputs()` 时调 `.unpack()`。如果这个输入本身来自外层 checkpoint 的占位符，unpack 时就会触发外层重算——于是嵌套语义自然成立。
+```python
+def inner_fn(x):
+    y = x.sin()      # sin 反向需要保存 x
+    return y.cos()   # cos 反向需要保存 y
+
+def outer_fn(x):
+    a = checkpoint(inner_fn, x, use_reentrant=False)  # 内层 CP
+    return a * 2       # mul 反向需要保存 a
+
+x = torch.randn(10, requires_grad=True)
+out = checkpoint(outer_fn, x, use_reentrant=False)    # 外层 CP
+out.sum().backward()
+```
+
+外层 `checkpoint` 包裹 `outer_fn`，内层 `checkpoint` 包裹 `inner_fn`。这就是嵌套。
+
+#### 5.9.2 前置知识：hook 是"栈"，只有栈顶生效
+
+`saved_tensors_hooks` 是一个**栈**（`graph.py:322` 明确警告："Only one pair of hooks is allowed at a time. When recursively nesting, only the inner-most pair of hooks will be applied."）。
+
+C++ 层 `SavedVariable` 构造时调 `get_default_hooks()`（`saved_variable.cpp:112`），只取**栈顶**那一对 hook。所以：
+
+- 外层 hook 压栈后，栈 = `[外层]`，栈顶 = 外层
+- 内层 hook 压栈后，栈 = `[外层, 内层]`，栈顶 = 内层 ← **只有内层 hook 会被调用**
+- 内层 hook 出栈后，栈 = `[外层]`，栈顶 = 外层
+
+#### 5.9.3 Rule 1：被保存的张量只由最内层 checkpoint 管理，对外层不可见
+
+前向时，hook 栈的变化如下（关键看"谁在栈顶"）：
+
+```text
+步骤                              hook 栈(顶→底)     发生什么
+─────────────────────────────────────────────────────────────────────────
+1. 外层 checkpoint 开始            []                 无 hook
+   outer_frame.save_inputs(x)                        x 正常存(无 hook,直接存真值)
+   push 外层 _checkpoint_hook    [外层]
+   yield (让用户代码跑)
+
+2. outer_fn(x) 执行中             [外层]
+   遇到 checkpoint(inner_fn, x)
+   inner_frame.save_inputs(x)    ← ★ 此时栈顶是外层! 见 Rule 2
+   push 内层 _checkpoint_hook    [内层, 外层]
+   yield (让 inner_fn 跑)
+
+3. inner_fn(x) 执行中             [内层, 外层]       栈顶 = 内层
+   y = x.sin()                                      sin 要保存 x
+                                                     → 调栈顶 = 内层 pack_hook(x)
+                                                     → 存内层 _Holder_0 (不是真 x!)
+   y.cos()                                          cos 要保存 y
+                                                     → 调内层 pack_hook(y)
+                                                     → 存内层 _Holder_1
+
+4. 内层 checkpoint 结束            [外层]             pop 内层 hook
+   返回 a = y.cos() 的结果
+
+5. a * 2                         [外层]              栈顶 = 外层
+   mul 要保存 a                                      → 调外层 pack_hook(a)
+                                                     → 存外层 _Holder_A
+
+6. 外层 checkpoint 结束            []                 pop 外层 hook
+   返回 out
+```
+
+**Rule 1 的体现**：在步骤 3 里，`sin` 保存 `x`、`cos` 保存 `y` 时，栈顶是**内层** hook，所以这两个张量被内层的 `pack_hook` 换成了内层的 `_Holder`。外层 hook **完全没被调用**，外层根本不知道 `x` 和 `y` 的存在——它们被"隐藏"了。
+
+如果外层 hook 也被调用，外层也会给 `x`、`y` 创建占位符，那就乱了（一个张量被两层同时管理）。栈机制保证每个被保存的张量**只被最内层那一层 hook 拦截一次**。
+
+#### 5.9.4 Rule 2：内层 checkpoint 的输入，被视为"保存到父 checkpoint 的张量"
+
+这是最精妙的一步。看步骤 2 中 `inner_frame.save_inputs(x)` 发生了什么：
+
+```python
+# checkpoint.py:826
+def save_inputs(self, *args):
+    self.saved_args = [
+        _make_saved_tensor(arg, is_output=False)   # ← 关键!
+        if isinstance(arg, torch.Tensor) else arg
+        for arg in args
+    ]
+```
+
+`_make_saved_tensor(x)` 创建一个 C++ `SavedVariable`（`init.cpp:681`）。`SavedVariable` 构造函数（`saved_variable.cpp:58`）发现**当前有 hook 激活**（此时栈顶是外层 hook！），于是调用**外层的 `pack_hook(x)`**：
+
+```python
+# 外层的 _checkpoint_hook.pack_hook (checkpoint.py:1139)
+def pack_hook(x):
+    holder = _Holder()
+    frame.weak_holders.append(weakref.ref(holder))  # ← 挂到外层 frame!
+    return holder   # ← 这个外层 _Holder 被存进 inner_frame.saved_args
+```
+
+结果：**内层 frame 保存的"输入 x"，实际上存的是外层的 `_Holder` 占位符**，而不是真正的 `x`。
+
+这就是 Rule 2 的字面意思：内层 checkpoint 的输入（x），被当作"保存到父 checkpoint（外层）的张量"来处理。外层 hook 给它创建了一个 `_Holder`，外层 frame 的 `weak_holders` 里多了一条。
+
+前向结束后，两个 frame 的状态：
+
+```text
+outer_frame:
+  saved_args     = [真正的 x]              (最外层,无 hook,直接存真值)
+  weak_holders   = [外层_Holder_x,         (步骤2: inner的输入x, 走了外层hook)
+                    外层_Holder_a]          (步骤5: mul的输入a)
+
+inner_frame:
+  saved_args     = [外层_Holder_x]         (★ Rule 2: 存的是外层的占位符!)
+  weak_holders   = [内层_Holder_0,         (步骤3: sin保存的x)
+                    内层_Holder_1]          (步骤3: cos保存的y)
+```
+
+如果没有 Rule 2（内层输入不存成外层占位符，而是直接存真值 `x`），那内层重算时直接拿 `x` 就行，不需要外层重算——但这样内层的输入 `x` 就会一直占着显存，**省显存的目的就达不到了**。Rule 2 正是为了让内层的输入也享受 checkpoint 的省显存待遇：把它交给外层管理，外层在前向时也把它换成占位符释放掉。
+
+#### 5.9.5 推论：要重算某个张量，必须重算包裹它的所有层 checkpoint
+
+反向时，autograd 沿图逆拓扑执行。假设先需要 `a`（mul 的输入）→ 触发外层 `unpack_hook(外层_Holder_a)`：
+
+```text
+反向流程:
+═══════════════════════════════════════════════════════════════
+
+① autograd 需要 a → unpack(外层_Holder_a)
+   外层 is_recomputed? No → 重算外层
+
+② 重算外层: outer_frame.get_inputs() → 取回真正的 x (saved_args[0], 无hook直接存真值)
+   with _recomputation_hook(outer_frame): recompute_fn(x)
+   → 重跑 outer_fn(x)
+
+③ 重跑 outer_fn(x) 时, 又遇到 checkpoint(inner_fn, x)
+   → 内层 checkpoint 再次执行 (Rule 3: 重算时遇到的 checkpoint 仍然生效)
+   → inner_fn(x) 重新跑了一遍, sin/cos 重新算
+   → 产出了真实的 a
+   → a 被 mul 保存时走外层 _recomputation_hook.pack_hook
+   → 填入 outer_frame.recomputed[外层_Holder_a] = 真实 a
+   → early_stop: 算够了, 停止
+
+④ 外层 unpack_hook 返回真实 a → mul_backward 拿到 a, 算梯度
+
+⑤ autograd 继续反向, 需要 sin/cos 的保存张量 → unpack(内层_Holder_0)
+   内层 is_recomputed? No → 重算内层
+
+⑥ 重算内层: inner_frame.get_inputs()
+   → saved_args[0] 是 外层_Holder_x (Rule 2 存的!)
+   → 调用 .unpack() → 触发外层 unpack_hook(外层_Holder_x)
+   → 外层 is_recomputed? Yes! (步骤②已经重算过了)
+   → 直接从 outer_frame.recomputed 取回真实 x  ★ 不用再重算外层!
+   → 内层拿到真实 x
+
+⑦ with _recomputation_hook(inner_frame): recompute_fn(x)
+   → 重跑 inner_fn(x), sin/cos 重新算
+   → 填入 inner_frame.recomputed
+   → early_stop, 停止
+
+⑧ 内层 unpack_hook 返回 sin 保存的 x → sin_backward 继续
+```
+
+**推论的体现**：
+
+- 步骤⑤⑥：要重算内层（拿到 `sin`/`cos` 保存的张量），就需要内层的输入 `x`。而 `x` 存的是**外层的占位符**（Rule 2），解包它就必须先重算外层。所以"要重算内层的张量，必须先重算外层"——外层是包裹内层的 checkpoint。
+
+- 步骤⑥的 `is_recomputed = True`：外层在步骤②已经被重算过一次了（因为 `a` 先被需要），所以这里**直接取结果，不重复重算**。这就是 NOTE 里说的 "unless we have already done so in that backward for some other saved tensor"。
+
+#### 5.9.6 一张图总结
+
+```text
+           前向时 hook 栈与张量保存关系
+
+  外层 checkpoint 区域 (outer_fn)
+  ┌──────────────────────────────────────────────┐
+  │  外层 hook 生效区间                            │
+  │                                              │
+  │  save_inputs(x) → 直接存真值 x (无hook)       │
+  │                                              │
+  │  ┌── 内层 checkpoint 区域 (inner_fn) ──────┐  │
+  │  │  内层 hook 生效区间 (栈顶=内层)          │  │
+  │  │                                        │  │
+  │  │  save_inputs(x) → 走外层hook            │  │
+  │  │     ★ 存成外层 _Holder (Rule 2)        │  │
+  │  │                                        │  │
+  │  │  sin 保存 x → 走内层hook                │  │
+  │  │     ★ 存成内层 _Holder (Rule 1)        │  │
+  │  │  cos 保存 y → 走内层hook                │  │
+  │  │     ★ 存成内层 _Holder (Rule 1)        │  │
+  │  └────────────────────────────────────────┘  │
+  │                                              │
+  │  mul 保存 a → 走外层hook (内层已出栈)         │
+  │     ★ 存成外层 _Holder                       │
+  └──────────────────────────────────────────────┘
+
+           反向时重算的依赖链
+
+  需要 sin/cos 的张量 (内层)
+    → 重算内层
+      → 需要内层输入 x
+        → x 是外层 _Holder (Rule 2)
+          → 解包 → 触发外层重算 (推论)
+            → 外层重算产出 x
+              → (如果已重算过,直接取,不重复)
+            → 内层拿到 x, 重算完成
+              → 返回 sin/cos 的张量
+```
+
+#### 5.9.7 Rule 3：重算从"没有 checkpoint 激活"的状态开始
+
+NOTE 的 Rule 3（`checkpoint.py:653`）说："We should start recomputation as if there are no checkpoints currently active. Checkpoints encountered during recomputation are still respected."
+
+意思是：当某层 checkpoint 的 `unpack_hook` 触发重算时，重算开始前，hook 栈上当前激活的那些 checkpoint hook（即反向正在执行的各层）**不应该影响这次重算的 pack/unpack**。重算应该像一个"干净"的前向一样开始。但重算过程中如果**遇到新的 checkpoint 区域**（如步骤③重跑 `outer_fn` 时又遇到内层 `checkpoint(inner_fn, x)`），那个内层 checkpoint 仍然要正常生效。
+
+代码上，重算挂的是 `_recomputation_hook`（`checkpoint.py:1163`），它作为栈顶被 push 进去，专门负责把重算出的张量填进 frame 账本。而重算过程中遇到的内层 `checkpoint` 会建立自己的新 frame 并 push 自己的 `_checkpoint_hook`——这套栈机制自动保证了 Rule 3。
+
+#### 5.9.8 一句话总结
+
+> **Rule 1**（栈机制保证）：内层区域里的中间激活，只被内层 hook 拦截，换成内层占位符，外层看不见。
+>
+> **Rule 2**（`save_inputs` 用 `_make_saved_tensor` 实现）：内层的输入 `x`，是在外层 hook 激活时被存入的，所以走的是外层 `pack_hook`，存成外层占位符——这样 `x` 也被释放了，省显存。
+>
+> **推论**（Rule 2 的直接后果）：反向重算内层时，需要输入 `x`，而 `x` 是外层占位符，解包它就必须先重算外层。所以重算一个张量，必须重算包裹它的所有层 checkpoint（除非某层已经因别的张量被重算过了）。
 
 ---
 

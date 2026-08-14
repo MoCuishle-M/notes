@@ -474,7 +474,7 @@ out.sum().backward()
 
 `saved_tensors_hooks` 是一个**栈**（`graph.py:322` 明确警告："Only one pair of hooks is allowed at a time. When recursively nesting, only the inner-most pair of hooks will be applied."）。
 
-C++ 层 `SavedVariable` 构造时调 `get_default_hooks()`（`saved_variable.cpp:112`），只取**栈顶**那一对 hook。所以：
+C++ 层 `SavedVariable` 构造时调 `get_default_hooks()`（`saved_variable.cpp:111`），只取**栈顶**那一对 hook。所以：
 
 - 外层 hook 压栈后，栈 = `[外层]`，栈顶 = 外层
 - 内层 hook 压栈后，栈 = `[外层, 内层]`，栈顶 = 内层 ← **只有内层 hook 会被调用**
@@ -841,16 +841,16 @@ class CheckpointFunction(torch.autograd.Function):
 | `_CheckpointFrame`（重算账本） | `torch/utils/checkpoint.py:800` |
 | `_checkpoint_hook`（前向 pack/unpack） | `torch/utils/checkpoint.py:1137` |
 | `_recomputation_hook`（重算 pack/early_stop） | `torch/utils/checkpoint.py:1072` |
-| `_Holder` / `_Handle` | `torch/utils/checkpoint.py:791` / `:791` |
+| `_Holder` / `_Handle` | `torch/utils/checkpoint.py:795` / `:791` |
 | `recompute_fn` 定义 | `torch/utils/checkpoint.py:1603` |
 | `save_inputs` / `get_inputs`（嵌套语义） | `torch/utils/checkpoint.py:826` / `:833` |
 | 嵌套 checkpoint 规则 NOTE | `torch/utils/checkpoint.py:626` |
-| `early_stop` 开关 / `set_checkpoint_early_stop` | `torch/utils/checkpoint.py:757` / `:760` |
+| `early_stop` 开关 / `set_checkpoint_early_stop` | `torch/utils/checkpoint.py:757` / `:761` |
 | `saved_tensors_hooks`（Python 入口） | `torch/autograd/graph.py:264` |
 | `SavedVariable` 构造（C++ pack） | `torch/csrc/autograd/saved_variable.cpp:17`（:58-67 走 hook） |
 | `SavedVariable::unpack`（C++ unpack） | `torch/csrc/autograd/saved_variable.cpp:130`（:210 调 hook） |
 | composable checkpoint（FSDP 用） | `torch/distributed/_composable/checkpoint_activation.py:38` |
-| 选择性重计算 SAC（`context_fn`） | `torch/utils/checkpoint.py:1247`（`CheckpointPolicy`）/ `:1416`（`create_selective_checkpoint_contexts`） |
+| 选择性重计算 SAC（`context_fn`） | `torch/utils/checkpoint.py:1274`（`CheckpointPolicy`）/ `:1416`（`create_selective_checkpoint_contexts`） |
 
 ---
 

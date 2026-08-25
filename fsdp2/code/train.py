@@ -16,6 +16,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--distributed-backend", type=str, default="gloo",
                         help="分布式后端，CPU 环境下强制使用 gloo")
+    parser.add_argument("--steps", type=int, default=5,
+                        help="训练步数，便于快速进行 smoke test")
     return parser.parse_args()
 
 
@@ -63,7 +65,7 @@ def main():
     labels = torch.randint(0, 1000, (batch_size, seq_len), device=device)
 
     fsdp_model.train()
-    for step in range(5):
+    for step in range(args.steps):
         optimizer.zero_grad()
         logits, loss = fsdp_model(images, input_ids, labels=labels)
         print(f"[Rank {rank}] Step {step}: loss = {loss.item():.4f}")

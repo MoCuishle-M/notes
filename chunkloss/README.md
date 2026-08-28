@@ -38,14 +38,14 @@ ChunkLoss 的核心目标不是改变损失函数，而是避免在同一时刻�
 语言模型交叉熵在 token 维度上可加：
 
 $$
-L = \frac{1}{\alpha}\sum_t \operatorname{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
+L = \frac{1}{\alpha}\sum_t \mathrm{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
 $$
 
 把序列划分为若干互不重叠的块 $C_i$ 后：
 
 $$
 L = \frac{1}{\alpha}\sum_i\sum_{t\in C_i}
-\operatorname{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
+\mathrm{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
 $$
 
 只要所有块使用与原始 loss 一致的：
@@ -59,7 +59,7 @@ $$
 
 $$
 \frac{\partial L}{\partial H}
-= \operatorname{concat}_i\!\left(\frac{\partial L_i}{\partial H_i}\right),
+= \mathrm{concat}_{i}\!\left(\frac{\partial L_i}{\partial H_i}\right),
 \qquad
 \frac{\partial L}{\partial W}
 = \sum_i\frac{\partial L_i}{\partial W}
@@ -174,9 +174,9 @@ features:
 所有 tile 扫描完成后：
 
 $$
-\operatorname{CE}_t
-=\operatorname{logsumexp}(\operatorname{logits}_t)
--\operatorname{logit}_{t,\,y_t}
+\mathrm{CE}_{t}
+=\mathrm{logsumexp}\!\left(\mathrm{logits}_{t}\right)
+-\mathrm{logit}_{t,\,y_t}
 $$
 
 忽略位置贡献 0，最后对 token 求和。
@@ -186,7 +186,7 @@ $$
 CCE 前向只保存 hidden states、head weight、labels 和每个 token 的 `logsumexp`。反向再次逐 tile 重算 logits，然后计算：
 
 $$
-G=\operatorname{softmax}(\operatorname{logits})-\operatorname{onehot}(\text{labels}),
+G=\mathrm{softmax}\!\left(\mathrm{logits}\right)-\mathrm{onehot}\!\left(\mathrm{labels}\right),
 \qquad
 dH=GW,
 \qquad

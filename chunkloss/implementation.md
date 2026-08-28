@@ -250,10 +250,10 @@ s_{\text{new}}
 =s\,e^{m-m_{\text{new}}}
 +s_t\,e^{m_t-m_{\text{new}}},
 \qquad
-\operatorname{LSE}=m_{\text{new}}+\log s_{\text{new}}
+\mathrm{LSE}=m_{\text{new}}+\log s_{\text{new}}
 $$
 
-同时检查 label 是否落在当前词表 tile，若命中则抽取正确类别 logit。这样只需保存每个 token 的 $m$、$s$、正确类 logit，最终得到 $\operatorname{LSE}-\operatorname{logit}_{y}$，不需要完整词表 logits。
+同时检查 label 是否落在当前词表 tile，若命中则抽取正确类别 logit。这样只需保存每个 token 的 $m$、$s$、正确类 logit，最终得到 $\mathrm{LSE}-\mathrm{logit}_{y}$，不需要完整词表 logits。
 
 ### 8.3 多 stream 流水
 
@@ -273,9 +273,9 @@ $\mathrm{lse}\in\mathbb{R}^{N}$。
 反向逐词表 tile：
 
 1. 重算 $\mathrm{hidden}\,\mathrm{weight}_{\mathrm{tile}}^{\mathsf T}$；
-2. 原地改写 tile 为 $\operatorname{softmax}-\operatorname{onehot}$，ignore token 置零；
+2. 原地改写 tile 为 $\mathrm{softmax}-\mathrm{onehot}$，ignore token 置零；
 3. $dW_{\mathrm{tile}}=G_{\mathrm{tile}}^{\mathsf T}\mathrm{hidden}$；
-4. $dH\mathrel{+}=G_{\mathrm{tile}}\mathrm{weight}_{\mathrm{tile}}$。
+4. $dH \leftarrow dH+G_{\mathrm{tile}}\mathrm{weight}_{\mathrm{tile}}$。
 
 最后按上游 `grad_output` 缩放并返回 hidden 与 weight 梯度。CCE loss 在 `build_loss_func()` 外层再除以 $\alpha$，autograd 会把这个归一化自动传入 `grad_output`。
 

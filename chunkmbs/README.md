@@ -48,8 +48,8 @@ $$
 对普通逐样本 Transformer 层，batch 中各样本的前向互不依赖：
 
 $$
-F\!\left(\operatorname{concat}(x_0,x_1,\ldots)\right)
-=\operatorname{concat}\!\left(F(x_0),F(x_1),\ldots\right)
+F\!\left(\mathrm{concat}\!\left(x_0,x_1,\ldots\right)\right)
+=\mathrm{concat}\!\left(F(x_0),F(x_1),\ldots\right)
 $$
 
 `torch.cat` 本身可求导，反向时上游梯度会按同样边界分发到各 chunk；每个 chunk 对共享参数产生的梯度由 autograd 累加。因此实现不需要自定义 `autograd.Function`。

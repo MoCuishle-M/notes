@@ -28,7 +28,7 @@ Trainer.get_model()
        └─ FSDP unshard
             └─ ChunkMBS wrapper
                  ├─ slice inputs
-                 ├─ old_forward(chunk_0..K-1)
+                 ├─ old_forward(各个 chunk)
                  └─ cat outputs
        └─ FSDP reshard
 ```
@@ -321,13 +321,13 @@ FSDP post-forward: optional reshard
 - `chunk_mbs=2`、`batch_dim=0`；
 - 位置参数 0 与四个 batch 相关 kwargs 被切分。
 
-对每个 language layer，执行形态是：
+对每个 language layer，执行形态是（$B=4$、$C=2$）：
 
 ```text
-一次 FSDP layer 调用，B=4
-  ├─ forward samples [0:2]
-  └─ forward samples [2:4]
-cat -> B=4 output
+一次 FSDP layer 调用
+  ├─ forward chunk 0
+  └─ forward chunk 1
+cat -> 完整 batch output
 ```
 
 仓库 ST 配置 `tests/st/run_configs/finetune_qwen3_5_35B/qwen3_5_35B_config.yaml` 使用同样的特性参数，训练 6 iter；但代码库当前没有针对 `_slice_batch_recursive`、输出结构和梯度等价性的独立 UT。

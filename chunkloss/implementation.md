@@ -235,21 +235,25 @@ backward 取出预计算梯度。如果上游梯度不是 1，就同时缩放 hi
 
 ### 8.1 公共入口
 
-`chunk_loss_cce_fused()` 将 `[B,S,H]` 和 `[B,S]` 展平为 `[N,H]`、`[N]`。如果配置了有效 `seq_chunk_size`，它再按展平 token 范围调用多个 `ChunkLossCceFused.apply()` 并累加 loss；否则单次处理全部 token。
+`chunk_loss_cce_fused()` 将 $[B,S,H]$ 和 $[B,S]$ 展平为 $[N,H]$、$[N]$。如果配置了有效 `seq_chunk_size`，它再按展平 token 范围调用多个 `ChunkLossCceFused.apply()` 并累加 loss；否则单次处理全部 token。
 
 Triton kernel 在函数内部延迟导入，隔离了可选依赖。
 
 ### 8.2 online log-sum-exp
 
-设当前累计状态为最大值 `m` 与移位指数和 `s`，新词表 tile 的状态为 `m_t`、`s_t`，合并公式为：
+设当前累计状态为最大值 $m$ 与移位指数和 $s$，新词表 tile 的状态为 $m_t$、$s_t$，合并公式为：
 
-```text
-m_new = max(m, m_t)
-s_new = s × exp(m - m_new) + s_t × exp(m_t - m_new)
-LSE = m_new + log(s_new)
-```
+$$
+m_{\text{new}}=\max(m,m_t),
+\qquad
+s_{\text{new}}
+=s\,e^{m-m_{\text{new}}}
++s_t\,e^{m_t-m_{\text{new}}},
+\qquad
+\operatorname{LSE}=m_{\text{new}}+\log s_{\text{new}}
+$$
 
-同时检查 label 是否落在当前词表 tile，若命中则抽取正确类别 logit。这样只需保存每个 token 的 `m`、`s`、正确类 logit，最终得到 `LSE - correct`，不需要完整词表 logits。
+同时检查 label 是否落在当前词表 tile，若命中则抽取正确类别 logit。这样只需保存每个 token 的 $m$、$s$、正确类 logit，最终得到 $\operatorname{LSE}-\operatorname{logit}_{y}$，不需要完整词表 logits。
 
 ### 8.3 多 stream 流水
 
@@ -258,24 +262,22 @@ LSE = m_new + log(s_new)
 - `stream_cube`：矩阵乘，包括前向投影、反向重算、`dW` 和 `dH`；
 - `stream_vec`：Triton online-softmax 与 `softmax-onehot` tile kernel。
 
-3 个 `[N, vocab_tile_size]` buffer 轮转使用。每个 tile 对应若干 event，约束“buffer 可复用、矩阵乘完成、向量 kernel 完成、梯度矩阵乘完成”的顺序，并预取下一个 tile 的重算矩阵乘。
+3 个 $[N,\text{vocab\_tile\_size}]$ buffer 轮转使用。每个 tile 对应若干 event，约束“buffer 可复用、矩阵乘完成、向量 kernel 完成、梯度矩阵乘完成”的顺序，并预取下一个 tile 的重算矩阵乘。
 
 ### 8.4 CCE backward
 
-前向保存：
-
-```text
-hidden [N,H], weight [V,H], labels [N], lse [N]
-```
+前向保存的主要张量形状为：$\mathrm{hidden}\in\mathbb{R}^{N\times H}$、
+$\mathrm{weight}\in\mathbb{R}^{V\times H}$、$\mathrm{labels}\in\mathbb{R}^{N}$、
+$\mathrm{lse}\in\mathbb{R}^{N}$。
 
 反向逐词表 tile：
 
-1. 重算 `hidden @ weight_tile^T`；
-2. 原地改写 tile 为 `softmax - onehot`，ignore token 置零；
-3. `dW_tile = G_tile^T @ hidden`；
-4. `dH += G_tile @ weight_tile`。
+1. 重算 $\mathrm{hidden}\,\mathrm{weight}_{\mathrm{tile}}^{\mathsf T}$；
+2. 原地改写 tile 为 $\operatorname{softmax}-\operatorname{onehot}$，ignore token 置零；
+3. $dW_{\mathrm{tile}}=G_{\mathrm{tile}}^{\mathsf T}\mathrm{hidden}$；
+4. $dH\mathrel{+}=G_{\mathrm{tile}}\mathrm{weight}_{\mathrm{tile}}$。
 
-最后按上游 `grad_output` 缩放并返回 hidden 与 weight 梯度。CCE loss 在 `build_loss_func()` 外层再除以 `alpha`，autograd 会把这个归一化自动传入 `grad_output`。
+最后按上游 `grad_output` 缩放并返回 hidden 与 weight 梯度。CCE loss 在 `build_loss_func()` 外层再除以 $\alpha$，autograd 会把这个归一化自动传入 `grad_output`。
 
 ## 9. Megatron-FSDP2 过渡路径
 
@@ -302,7 +304,7 @@ hidden [N,H], weight [V,H], labels [N], lse [N]
 - `tests/ut_fsdp/loss/test_loss_func.py`：验证原生 FSDP2 的 chunk/non-chunk loss 数值一致、错误处理和 packing 语义。
 - `tests/ut_fsdp/loss/test_dynamic_chunkloss.py`：验证动态块长公式、边界退化与 `build_loss_func` 分支选择。
 
-测试中使用的主要容差为：loss `rtol=1e-5, atol=1e-6`，梯度 `rtol=1e-4, atol=1e-5`。这体现的是浮点容差内等价，而非逐 bit 相同。
+测试中使用的主要容差为：loss（$\mathrm{rtol}=10^{-5}$、$\mathrm{atol}=10^{-6}$），梯度（$\mathrm{rtol}=10^{-4}$、$\mathrm{atol}=10^{-5}$）。这体现的是浮点容差内等价，而非逐 bit 相同。
 
 在当前提交中，没有找到针对 CCE kernel 的仓库单元测试。CCE 是近期接入的 NPU/Triton 路径，使用前应在目标硬件上额外完成：
 
@@ -316,7 +318,7 @@ hidden [N,H], weight [V,H], labels [N], lse [N]
 
 ### 11.1 注释中的 “feature dimension”
 
-`ChunkLoss` 类 docstring 写过 “feature dimension”，但实际 `torch.split(..., dim=1)`；对 `[B,S,H]` 输入，切的是序列维，不是 hidden feature 维。
+`ChunkLoss` 类 docstring 写过 “feature dimension”，但实际 `torch.split(..., dim=1)`；对 $[B,S,H]$ 输入，切的是序列维，不是 hidden feature 维。
 
 ### 11.2 “逐块反向”发生在自定义 forward 内
 
@@ -324,8 +326,8 @@ hidden [N,H], weight [V,H], labels [N], lse [N]
 
 ### 11.3 legacy 和 CCE 的 `chunk_size` 语义不同
 
-- legacy：沿 `[B,S,H]` 的 `S` 切，每个块约 `B × chunk_size` 个 token；
-- CCE：公共入口先展平为 `N=B×S`，可选外层分段按 `N` 切。
+- legacy：沿 $[B,S,H]$ 的 $S$ 切，每个块约 $B\times\text{chunk\_size}$ 个 token；
+- CCE：公共入口先展平为 $N=B\times S$，可选外层分段按 $N$ 切。
 
 比较参数或迁移配置时不能直接把两者视为同一单位。
 

@@ -24,30 +24,33 @@ ChunkMBS 试图同时保留两者的优点：训练调度器向模型提交一�
 
 ## 2. 核心思想
 
-设当前训练 micro batch 的 batch size 为 `B`，`chunk_mbs=C`。ChunkMBS 计算：
+设当前训练 micro batch 的 batch size 为 $B$，并记 `chunk_mbs` 为 $C$。ChunkMBS 计算：
+
+$$
+K=\left\lceil\frac{B}{C}\right\rceil
+$$
 
 ```text
-K = ceil(B / C)
-
-input [B, ...]
-  ├─ [0:C, ...]       ── Block ── output_0
-  ├─ [C:2C, ...]      ── Block ── output_1
-  └─ [...]            ── Block ── output_K-1
-                                      │
+完整输入 batch
+  ├─ chunk 0 ── Block ── output 0
+  ├─ chunk 1 ── Block ── output 1
+  └─ ...      ── Block ── output K-1
+                               │
                          cat(batch_dim)
-                                      ▼
-                               output [B, ...]
+                               ▼
+                         完整输出 batch
 ```
 
-最后一块允许小于 `C`。如果 `B <= C`，代码直接调用原始 forward，不做切分与拼接。
+最后一块允许小于 $C$。如果 $B\le C$，代码直接调用原始 forward，不做切分与拼接。
 
 ### 2.1 为什么数学上可行
 
 对普通逐样本 Transformer 层，batch 中各样本的前向互不依赖：
 
-```text
-F(concat(x_0, x_1, ...)) = concat(F(x_0), F(x_1), ...)
-```
+$$
+F\!\left(\operatorname{concat}(x_0,x_1,\ldots)\right)
+=\operatorname{concat}\!\left(F(x_0),F(x_1),\ldots\right)
+$$
 
 `torch.cat` 本身可求导，反向时上游梯度会按同样边界分发到各 chunk；每个 chunk 对共享参数产生的梯度由 autograd 累加。因此实现不需要自定义 `autograd.Function`。
 
@@ -65,7 +68,7 @@ F(concat(x_0, x_1, ...)) = concat(F(x_0), F(x_1), ...)
   ↑ FSDP2 module hooks / fully_shard
 ```
 
-运行时，调用一次 FSDP module，FSDP 的外层 hook 先 unshard 参数；随后 ChunkMBS wrapper 在同一次 module 调用内部循环执行 `K` 个小块；所有小块完成并拼接后，FSDP 才执行 forward 后处理和 reshard。因此目标层的一次大 batch 调用对应一次参数 unshard，而不是每个 chunk 一次。
+运行时，调用一次 FSDP module，FSDP 的外层 hook 先 unshard 参数；随后 ChunkMBS wrapper 在同一次 module 调用内部循环执行 $K$ 个小块；所有小块完成并拼接后，FSDP 才执行 forward 后处理和 reshard。因此目标层的一次大 batch 调用对应一次参数 unshard，而不是每个 chunk 一次。
 
 ### 2.3 为什么仍需要重计算和激活卸载
 
@@ -75,19 +78,19 @@ F(concat(x_0, x_1, ...)) = concat(F(x_0), F(x_1), ...)
 
 - **recompute**：forward 只保存 checkpoint 边界输入，backward 时按 chunk 重算层内计算；
 - **async activation offload**：通过 `saved_tensors_hooks` 将符合条件的入口激活异步 D2H 搬到 Host，backward 取用时 H2D 搬回并预取；
-- **ChunkMBS**：把进入 checkpoint/offload wrapper 的输入先切小，使重算时的瞬时层内激活以 `C` 而不是 `B` 为尺度。
+- **ChunkMBS**：把进入 checkpoint/offload wrapper 的输入先切小，使重算时的瞬时层内激活以 $C$ 而不是 $B$ 为尺度。
 
 三者共同作用，才形成“一次参数聚合、多个小块计算、设备侧瞬时激活接近单块规模”的设计。
 
 ## 3. 与大 MBS、梯度累积的区别
 
-以下比较固定单个数据并行 rank 每次参数更新处理 `B` 个样本，忽略 pipeline 等其他并行因素：
+以下比较固定单个数据并行 rank 每次参数更新处理 $B$ 个样本，忽略 pipeline 等其他并行因素：
 
 | 方案 | 调度器 MBS | 梯度累积 | Block 每次更新的调用/Unshard 次数 | 层内激活尺度 |
 |---|---:|---:|---:|---:|
-| 小 MBS + 梯度累积 | `C` | `B/C` | 约 `B/C` 次 | `C` |
-| 直接大 MBS | `B` | 1 | 1 次 | `B` |
-| 大 MBS + ChunkMBS | `B` | 1 | 1 次 | 目标接近 `C` |
+| 小 MBS + 梯度累积 | $C$ | $B/C$ | 约 $B/C$ 次 | $C$ |
+| 直接大 MBS | $B$ | 1 | 1 次 | $B$ |
+| 大 MBS + ChunkMBS | $B$ | 1 | 1 次 | 目标接近 $C$ |
 
 ChunkMBS 不会改变训练调度器对 MBS、GBS 和梯度累积的定义，也不会把一个 optimizer step 拆成多个 step。它只改写选定 module 的一次 forward。
 
@@ -134,11 +137,11 @@ training:
 | `enable_chunk_mbs` | 开启目标层 forward 包装 |
 | `apply_modules` | 用 `module_name_match` 匹配的 module 路径列表；一个都匹配不到会报错 |
 | `chunk_mbs` | **切分后每一块的 batch size**，不是块数 |
-| `batch_dim` | 所有被切 Tensor 的 batch 所在维度；`[B,S,H]` 通常为 0，`[S,B,H]` 通常为 1 |
+| `batch_dim` | 所有被切 Tensor 的 batch 所在维度；$[B,S,H]$ 通常为 0，$[S,B,H]$ 通常为 1 |
 | `chunk_arg_indexs` | 需要切分的位置参数索引；默认 `[0]` |
 | `chunk_kwarg_names` | 需要切分的关键字参数名；默认空列表 |
 
-如果希望把 `B=8` 恢复成传统 `MBS=2` 的单块计算尺度，应设置 `chunk_mbs: 2`，此时块数是 `ceil(8/2)=4`。上游入口文档效果章节写的 `chunk_mbs=GBS/MBS` 容易把“块大小”和“块数”混淆；应以实现中的 `start=i*chunk_mbs`、`end=start+chunk_mbs` 为准。
+如果希望把 $B=8$ 恢复成传统 $\mathrm{MBS}=2$ 的单块计算尺度，应设置 `chunk_mbs: 2`，此时块数是 $\lceil 8/2\rceil=4$。上游入口文档效果章节写的 $\mathrm{chunk\_mbs}=\mathrm{GBS}/\mathrm{MBS}$ 容易把“块大小”和“块数”混淆；应以实现中的 `start=i*chunk_mbs`、`end=start+chunk_mbs` 为准。
 
 ### 4.2 哪些输入必须切
 
@@ -157,7 +160,7 @@ decoder_layer(
 
 通常 `hidden_states` 是位置参数 0；`position_embeddings`、`attention_mask`、`position_ids` 是关键字参数。标量、开关、cache 对象等与 batch 无关的参数应原样传递，不应列入切分配置。
 
-切分函数会递归处理 Tensor、tuple、list 和 dict，所以一个配置项可以是嵌套 Tensor 容器。但它会对该容器中的**每一个 Tensor**使用同一个 `batch_dim` 和 `[start:end]`，配置前必须确认它们的 layout 一致。
+切分函数会递归处理 Tensor、tuple、list 和 dict，所以一个配置项可以是嵌套 Tensor 容器。但它会对该容器中的**每一个 Tensor**使用同一个 `batch_dim` 和 $[\text{start}:\text{end}]$，配置前必须确认它们的 layout 一致。
 
 ## 5. 收益与代价
 

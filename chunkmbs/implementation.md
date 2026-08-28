@@ -191,12 +191,22 @@ return data[tuple(slices)]
 num_micros = (full_batch_size + chunk_mbs - 1) // chunk_mbs
 ```
 
+这段整数运算等价于数学公式
+
+$$
+K=\left\lceil\frac{B}{C}\right\rceil,
+$$
+
+其中 $B$ 对应 `full_batch_size`，$C$ 对应 `chunk_mbs`，$K$ 对应 `num_micros`。$\lceil\cdot\rceil$ 是向上取整，`//` 是正整数的向下整除；先加 $C-1$，可以把非整除时的余数“进一块”。例如 $B=5$、$C=2$ 时，代码计算 `(5+2-1)//2=3`，与 $\lceil5/2\rceil=3$ 一致。
+
 第 `i` 块边界：
 
 ```python
 start = i * chunk_mbs
 end = min(start + chunk_mbs, full_batch_size)
 ```
+
+$i$ 从 0 到 $K-1$。`start` 是当前块的起始下标（包含），`end` 是结束下标（不包含）；`min` 保证最后一块不会越过完整 batch 的末尾。继续使用 $B=5$、$C=2$ 的例子，三个半开区间依次为 $[0,2)$、$[2,4)$、$[4,5)$，对应 Python 切片 `0:2`、`2:4`、`4:5`，因此没有遗漏或重复样本。
 
 随后分别构建位置参数和关键字参数：
 

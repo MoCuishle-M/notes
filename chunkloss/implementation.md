@@ -235,7 +235,7 @@ backward 取出预计算梯度。如果上游梯度不是 1，就同时缩放 hi
 
 ### 8.1 公共入口
 
-`chunk_loss_cce_fused()` 将 `[B,S,H]` 和 `[B,S]` 展平为 `[N,H]`、`[N]`。如果配置了有效 `seq_chunk_size`，它再按展平 token 范围调用多个 `ChunkLossCceFused.apply()` 并累加 loss；否则单次处理全部 token。
+`chunk_loss_cce_fused()` 将 `[B,S,H]` 和 `[B,S]` 展平为 `[N,H]`、`[N]`，其中 $B$ 是 batch size、$S$ 是序列长度、$H$ 是 hidden size，$N=B\times S$ 是展平后的 token 总数。例如 `[2,3,H]` 含有 $2\times3=6$ 个 token，展平后形状是 `[6,H]`。如果配置了有效 `seq_chunk_size`，它再按展平 token 范围调用多个 `ChunkLossCceFused.apply()` 并累加 loss；否则单次处理全部 token。
 
 Triton kernel 在函数内部延迟导入，隔离了可选依赖。
 
@@ -252,6 +252,14 @@ s_{\mathrm{new}}
 \qquad
 \mathrm{LSE}=m_{\mathrm{new}}+\log s_{\mathrm{new}}
 $$
+
+式中 $m$ 是已扫描词表 tile 中每个 token 的最大 logit，$s$ 是以 $m$ 为基准平移后的指数和；$m_t$、$s_t$ 是新 tile 的对应状态。$m_{\mathrm{new}}$ 取两部分最大值，再用指数因子把两个指数和换算到同一个新基准。$\mathrm{LSE}$ 是 `log-sum-exp`，即 $\log\sum_j e^{z_j}$。这种“减去最大值再求指数和”的技巧能避免直接计算较大 $e^{z_j}$ 时溢出。
+
+例如已扫描 tile 的 logits 为 $[2,1]$，则 $m=2$、$s=e^{2-2}+e^{1-2}=1+e^{-1}\approx1.3679$；新 tile 为 $[0,-1]$，则 $m_t=0$、$s_t=1+e^{-1}\approx1.3679$。合并后
+$m_{\mathrm{new}}=2$，
+$s_{\mathrm{new}}=1.3679+1.3679e^{-2}\approx1.5530$，最终
+$\mathrm{LSE}=2+\log(1.5530)\approx2.4402$。它与一次性计算
+$\log(e^2+e^1+e^0+e^{-1})$ 相同，但全过程只保存每个 tile 的两个状态量。
 
 同时检查 label 是否落在当前词表 tile，若命中则抽取正确类别 logit。这样只需保存每个 token 的 `m`、`s`、正确类 logit，最终得到 `LSE - logit_y`，不需要完整词表 logits。
 
@@ -275,6 +283,8 @@ $$
 2. 原地改写 tile 为 `softmax - onehot`，ignore token 置零；
 3. 计算 `dW_tile = G_tile^T × hidden`；
 4. 累加 `dH = dH + G_tile × weight_tile`。
+
+这里 `G_tile` 是当前词表 tile 范围内的 `softmax - onehot`，即 loss 对局部 logits 的梯度；`T` 表示转置。`dW_tile` 是这一段词表权重的梯度，`dH` 是 hidden 梯度。矩阵乘法会自动沿 token 维求和：例如同一个权重元素从两个 token 得到的贡献为 0.3 和 -0.1，写入 `dW_tile` 的总贡献就是 0.2；而各词表 tile 对同一 hidden 向量都有影响，所以 `dH` 需要在 tile 循环中继续累加。
 
 最后按上游 `grad_output` 缩放并返回 hidden 与 weight 梯度。CCE loss 在 `build_loss_func()` 外层再除以 `α`，autograd 会把这个归一化自动传入 `grad_output`。
 
@@ -304,6 +314,14 @@ $$
 - `tests/ut_fsdp/loss/test_dynamic_chunkloss.py`：验证动态块长公式、边界退化与 `build_loss_func` 分支选择。
 
 测试中使用的主要容差为：loss（`rtol=1e-5`、`atol=1e-6`），梯度（`rtol=1e-4`、`atol=1e-5`）。这体现的是浮点容差内等价，而非逐 bit 相同。
+
+`rtol` 是相对容差，允许误差随参考值的绝对值增大；`atol` 是绝对容差，为接近 0 的参考值提供固定误差下限。PyTorch 逐元素比较可写为
+
+$$
+|a-b|\le \mathrm{atol}+\mathrm{rtol}\times|b|,
+$$
+
+其中 $a$ 是待比较结果，$b$ 是参考结果，$|\cdot|$ 表示绝对值。例如 $b=1$、$a=1.000009$、`rtol=1e-5`、`atol=1e-6` 时，实际误差是 $9\times10^{-6}$，允许误差是 $10^{-6}+10^{-5}\times1=1.1\times10^{-5}$，因此该元素通过比较。
 
 在当前提交中，没有找到针对 CCE kernel 的仓库单元测试。CCE 是近期接入的 NPU/Triton 路径，使用前应在目标硬件上额外完成：
 

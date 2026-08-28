@@ -29,6 +29,9 @@ $$
 \approx 4.63\ \mathrm{GiB}
 $$
 
+式中最后的 `2 bytes` 表示一个 BF16 元素占 2 字节，`GiB` 是二进制容量单位，$1\ \mathrm{GiB}=2^{30}$ bytes。因此元素总数为
+$2\times8192\times151674=2,485,846,016$，乘以 2 bytes 后再除以 $2^{30}$，得到约 $4.63\ \mathrm{GiB}$。
+
 这还没有计入 FP32 转换和交叉熵内部临时张量。
 
 ChunkLoss 的核心目标不是改变损失函数，而是避免在同一时刻物化整个 `[B,S,V]` logits。
@@ -41,12 +44,29 @@ $$
 L = \frac{1}{\alpha}\sum_t \mathrm{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
 $$
 
+这里各符号的含义是：
+
+- $L$：完成归一化后的总 loss；$t$：token 位置索引；
+- $h_t\in\mathbb{R}^{H}$：第 $t$ 个 token 的隐藏向量；$W\in\mathbb{R}^{V\times H}$：lm_head 权重；$\mathbb{R}^{H}$ 表示由 $H$ 个实数组成的向量空间；
+- $W^{\mathsf T}$：$W$ 的转置，$h_tW^{\mathsf T}\in\mathbb{R}^{V}$ 是该 token 对词表中 $V$ 个类别的 logits；
+- $y_t$：正确类别在词表中的整数下标；$\mathrm{CE}$：交叉熵；$\alpha$：由 loss 类型决定的归一化系数，例如有效 token 总数；
+- $\sum_t$：把所有有效 token 的损失相加，ignore token 不参与求和。
+
+交叉熵衡量预测概率与正确类别之间的差异。对单个 token，若 logits 为
+$z=[2,1,0]$、正确类别 $y=0$，则先用 softmax 得到
+$p_j=e^{z_j}/\sum_k e^{z_k}\approx[0.665,0.245,0.090]$，再计算
+$\mathrm{CE}(z,y)=-\log p_y\approx0.408$。正确类别的预测概率越接近 1，交叉熵越接近 0。
+
 把序列划分为若干互不重叠的块 `C_i` 后：
 
 $$
 L = \frac{1}{\alpha}\sum_i\sum_{t\in C_i}
 \mathrm{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
 $$
+
+式中 $i$ 是块编号，$C_i$ 是第 $i$ 个块包含的 token 位置集合，$t\in C_i$ 表示位置 $t$ 属于该块。各 $C_i$ 互不重叠且并集覆盖全部待计算位置。例如 4 个 token 可分为
+$C_0=\{0,1\}$、$C_1=\{2,3\}$；若逐 token loss 为 $[0.2,0.4,0.3,0.1]$、$\alpha=4$，则
+$L=((0.2+0.4)+(0.3+0.1))/4=0.25$，与不分块直接求平均相同。
 
 只要所有块使用与原始 loss 一致的：
 
@@ -64,6 +84,8 @@ $$
 \frac{\partial L}{\partial W}
 = \sum_i\frac{\partial L_i}{\partial W}
 $$
+
+$L_i$ 表示第 $i$ 块尚未与其他块合并的损失；$H_i$ 是该块的 hidden states，$H$ 是完整 hidden states。$\partial L/\partial H$ 和 $\partial L/\partial W$ 分别表示 loss 对 hidden states、权重的梯度，即输入或参数发生微小变化时 loss 的变化率。$\mathrm{concat}_i$ 表示按原序列位置拼接：各 token 只属于一个块，所以 hidden 梯度放回各自位置；$\sum_i$ 表示逐元素相加：所有块共用同一个 $W$，所以其参数梯度需要累加。例如两块给同一权重元素的梯度分别为 $0.3$ 和 $-0.1$，完整梯度就是 $0.3+(-0.1)=0.2$。
 
 因此可以让每个块的 logits 在计算完 loss 和梯度后立即释放，只保留最终标量和必要梯度。
 
@@ -118,6 +140,8 @@ C_{\max}=\left\lfloor\frac{T}{B}\right\rfloor,
 C=2^{\left\lfloor\log_2 C_{\max}\right\rfloor}
 \quad (C\le C_{\max})
 $$
+
+式中 $T$ 是一次分块允许的总 token 上限，$B$ 是当前 batch size，$C_{\max}$ 是理论上每个样本最多可放入的 token 数，$C$ 是最终采用的 `chunk_size`。$\lfloor x\rfloor$ 是向下取整，例如 $\lfloor3.7\rfloor=3$；$\log_2x$ 表示“2 的多少次方等于 $x$”。第二步因此是在不超过 $C_{\max}$ 的前提下取最大的 2 的整数次幂。例如 $T=4096$、$B=3$ 时，$C_{\max}=\lfloor4096/3\rfloor=1365$；因为 $2^{10}=1024\le1365<2048=2^{11}$，所以 $C=1024$。
 
 例如 `T=4096`：
 
@@ -179,6 +203,10 @@ $$
 -\mathrm{logit}_{t,\,y_t}
 $$
 
+$\mathrm{logits}_t\in\mathbb{R}^{V}$ 是 token $t$ 的全部词表 logits，$\mathrm{logit}_{t,y_t}$ 是其中正确类别的那一个。`logsumexp` 定义为
+$\mathrm{logsumexp}(z)=\log\sum_j e^{z_j}$。它把“先指数、求和、再取对数”写成一个可数值稳定实现的运算；实践中会先减去最大值，避免 $e^{z_j}$ 溢出。仍以 $z=[2,1,0]$、$y=0$ 为例，
+$\mathrm{logsumexp}(z)\approx2.408$，所以 $\mathrm{CE}=2.408-2=0.408$，与前面的 softmax 计算一致。CCE 只改变这个量的流式计算方式，不改变交叉熵定义。
+
 忽略位置贡献 0，最后对 token 求和。
 
 ### 6.2 反向
@@ -192,6 +220,11 @@ dH=GW,
 \qquad
 dW=G^{\mathsf T}H
 $$
+
+这里公式中的大写 $H$ 表示 hidden states 矩阵，不是前文单独表示 hidden size 的 $H$。为消除形状书写中的歧义，暂用 $D$ 表示 hidden size，则参与计算的 token 展平后有：$H\in\mathbb{R}^{N\times D}$，$W\in\mathbb{R}^{V\times D}$，$G\in\mathbb{R}^{N\times V}$。$N$ 是 token 数，$G$ 是 loss 对 logits 的梯度；`onehot(labels)` 把每个整数标签变成只有正确类别为 1、其余为 0 的向量。$dH$、$dW$ 分别是对 hidden states 和 lm_head 权重的梯度，$G^{\mathsf T}$ 是 $G$ 的转置。
+
+例如 logits 为 $[2,1,0]$、label 为 0 时，softmax 约为 $[0.665,0.245,0.090]$，one-hot 向量为 $[1,0,0]$，所以
+$G\approx[-0.335,0.245,0.090]$。这表示提高正确类别 logit 会降低 loss，而提高错误类别 logit 会增大 loss。随后按矩阵乘法计算 $GW$，即可把这三个类别方向上的影响传回 hidden states；计算 $G^{\mathsf T}H$，则把同一权重在所有 token 上的贡献累加起来。
 
 `G` 也只在 tile 范围内存在。实现用两个设备 stream 分别承载矩阵乘和向量 kernel，并以 3 个轮转 buffer 和 event 建立依赖，重叠相邻 tile 的计算。
 

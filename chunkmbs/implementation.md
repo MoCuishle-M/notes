@@ -321,7 +321,7 @@ FSDP post-forward: optional reshard
 - `chunk_mbs=2`、`batch_dim=0`；
 - 位置参数 0 与四个 batch 相关 kwargs 被切分。
 
-对每个 language layer，执行形态是（$B=4$、$C=2$）：
+对每个 language layer，执行形态是（`B=4`、`C=2`）：
 
 ```text
 一次 FSDP layer 调用

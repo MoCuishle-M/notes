@@ -30,7 +30,7 @@ $$
 K=\left\lceil\frac{B}{C}\right\rceil
 $$
 
-式中 $B$ 是完整 micro batch 的样本数，$C$ 是每块最多包含的样本数（即 `chunk_mbs`），$K$ 是最终块数。$\lceil x\rceil$ 表示向上取整，也就是取不小于 $x$ 的最小整数；之所以向上取整，是因为不足一整块的尾部样本仍需要一个块。例如 $B=5$、$C=2$ 时，$K=\lceil5/2\rceil=3$，三个块的样本数依次为 2、2、1。
+式中 `B` 是完整 micro batch 的样本数，`C` 是每块最多包含的样本数（即 `chunk_mbs`），`K` 是最终块数。`ceil(x)` 表示向上取整，也就是取不小于 `x` 的最小整数；之所以向上取整，是因为不足一整块的尾部样本仍需要一个块。例如 `B=5`、`C=2` 时，`K=ceil(5/2)=3`，三个块的样本数依次为 2、2、1。
 
 ```text
 完整输入 batch
@@ -54,9 +54,9 @@ F\!\left(\mathrm{concat}\!\left(x_0,x_1,\ldots\right)\right)
 =\mathrm{concat}\!\left(F(x_0),F(x_1),\ldots\right)
 $$
 
-$F$ 表示被 ChunkMBS 包装的层，$x_i$ 是第 $i$ 个输入块，`concat` 表示沿 batch 维按原顺序拼接。等式左边是“先拼成完整 batch，再调用一次层”，右边是“每块分别调用同一个层，再拼接输出”。这里的数学依据是逐样本映射：$F$ 对一个样本的计算不读取其他样本的数据。
+`F` 表示被 ChunkMBS 包装的层，`x_i` 是第 `i` 个输入块，`concat` 表示沿 batch 维按原顺序拼接。等式左边是“先拼成完整 batch，再调用一次层”，右边是“每块分别调用同一个层，再拼接输出”。这里的数学依据是逐样本映射：`F` 对一个样本的计算不读取其他样本的数据。
 
-用简单的一维逐元素层 $F(x)=2x+1$ 举例：把 batch $[1,2,3]$ 分成 $x_0=[1,2]$、$x_1=[3]$。完整计算得到 $F([1,2,3])=[3,5,7]$；分块计算得到 $F(x_0)=[3,5]$、$F(x_1)=[7]$，拼接后仍是 $[3,5,7]$。真实 Transformer 层更复杂，但只要没有跨样本运算，batch 维上的关系相同。
+用简单的一维逐元素层 `F(x)=2x+1` 举例：把 batch `[1,2,3]` 分成 `x_0=[1,2]`、`x_1=[3]`。完整计算得到 `F([1,2,3])=[3,5,7]`；分块计算得到 `F(x_0)=[3,5]`、`F(x_1)=[7]`，拼接后仍是 `[3,5,7]`。真实 Transformer 层更复杂，但只要没有跨样本运算，batch 维上的关系相同。
 
 `torch.cat` 本身可求导，反向时上游梯度会按同样边界分发到各 chunk；每个 chunk 对共享参数产生的梯度由 autograd 累加。因此实现不需要自定义 `autograd.Function`。
 
@@ -98,7 +98,7 @@ $F$ 表示被 ChunkMBS 包装的层，$x_i$ 是第 $i$ 个输入块，`concat` �
 | 直接大 MBS | `B` | 1 | 1 次 | `B` |
 | 大 MBS + ChunkMBS | `B` | 1 | 1 次 | 目标接近 `C` |
 
-这里 MBS（micro batch size）是一次 forward 在单个数据并行 rank 上处理的样本数，GBS（global batch size）是一次参数更新在所有 rank 和所有梯度累积轮次中处理的样本总数。表中的 `B/C` 为便于比较假设 $B$ 能被 $C$ 整除；不能整除时，实际块数按前述 $\lceil B/C\rceil$ 计算。例如 $B=5$、$C=2$ 时不是 2.5 次调用，而是 3 次。
+这里 MBS（micro batch size）是一次 forward 在单个数据并行 rank 上处理的样本数，GBS（global batch size）是一次参数更新在所有 rank 和所有梯度累积轮次中处理的样本总数。表中的 `B/C` 为便于比较假设 `B` 能被 `C` 整除；不能整除时，实际块数按前述 `ceil(B/C)` 计算。例如 `B=5`、`C=2` 时不是 2.5 次调用，而是 3 次。
 
 ChunkMBS 不会改变训练调度器对 MBS、GBS 和梯度累积的定义，也不会把一个 optimizer step 拆成多个 step。它只改写选定 module 的一次 forward。
 
@@ -149,7 +149,7 @@ training:
 | `chunk_arg_indexs` | 需要切分的位置参数索引；默认 `[0]` |
 | `chunk_kwarg_names` | 需要切分的关键字参数名；默认空列表 |
 
-如果希望把 `B=8` 恢复成传统 `MBS=2` 的单块计算尺度，应设置 `chunk_mbs: 2`，此时块数是 $\lceil8/2\rceil=4$。上游入口文档效果章节写的 `chunk_mbs = GBS/MBS` 中，GBS 表示 global batch size、MBS 表示 micro batch size；这个商通常更接近“需要拆成多少份”的概念，容易和代码中表示“每块样本数”的 `chunk_mbs` 混淆。应以实现中的 `start=i*chunk_mbs`、`end=start+chunk_mbs` 为准。
+如果希望把 `B=8` 恢复成传统 `MBS=2` 的单块计算尺度，应设置 `chunk_mbs: 2`，此时块数是 `ceil(8/2)=4`。上游入口文档效果章节写的 `chunk_mbs = GBS/MBS` 中，GBS 表示 global batch size、MBS 表示 micro batch size；这个商通常更接近“需要拆成多少份”的概念，容易和代码中表示“每块样本数”的 `chunk_mbs` 混淆。应以实现中的 `start=i*chunk_mbs`、`end=start+chunk_mbs` 为准。
 
 ### 4.2 哪些输入必须切
 

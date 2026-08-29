@@ -335,7 +335,7 @@ $$
 
 $$
 m_n
-=\max_{0\le j<V}z_{n,j},
+=\max\left(z_{n,0},z_{n,1},\ldots,z_{n,V-1}\right),
 $$
 
 $$

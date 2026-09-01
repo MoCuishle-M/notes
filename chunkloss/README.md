@@ -1,275 +1,452 @@
-# ChunkLoss：背景、原理与使用边界
+# ChunkLoss 原理：以 Qwen3.5 35B 为例
 
-> 本文基于 MindSpeed-MM `master` 分支提交 `192b2a13`（2026-08-27）的代码整理。代码仍在演进，尤其是 CCE 实现比仓库中的入口文档更新；实际使用时应以当前代码和配置校验逻辑为准。
+## 1. 本文讨论什么
 
-## 1. ChunkLoss 解决什么问题
+自回归语言模型训练到最后，需要把每个 token 的隐藏向量投影到整个词表，再用下一个 token 作为标签计算交叉熵。词表很大、序列很长时，输出分数张量 `logits` 会成为显存峰值。
 
-自回归语言模型最后通常通过线性层把隐藏状态投影到词表：
+ChunkLoss 的核心思想是：沿序列维把 token 切成若干块，每次只为一块生成 logits、计算该块 loss 和梯度，处理完便释放该块 logits，再处理下一块。所有块的 loss 与梯度按原来的归约规则合并，因此最终优化目标不变。
 
-| 阶段 | 张量或运算 | 形状/结果 |
+本文只解释这一算法本身，不讨论它在训练框架中的接入方式。文中的实例参数来自 Qwen3.5 35B 训练脚本、模型配置，以及 2026-09-01 在 8 张 NPU 上完成的一次 20 轮实际训练观测。
+
+## 2. 先认识参与 loss 的张量
+
+### 2.1 符号和形状
+
+| 符号 | 含义 | 形状 |
 |---|---|---|
-| 输入 | hidden states | `[B,S,H]` |
-| 投影 | `lm_head`，权重 `W` | `W` 的形状为 `[V,H]` |
-| 输出 | logits | `[B,S,V]` |
-| 损失 | cross entropy | 标量 loss |
+| `B` | 当前设备一次参与 loss 计算的样本数 | 标量 |
+| `S` | 当前 batch 对齐后的序列长度 | 标量 |
+| `D` | 每个 token 的隐藏维度 | 标量 |
+| `V` | 词表大小，也就是分类类别数 | 标量 |
+| `H` | 主干网络输出的 hidden states | `[B,S,D]` |
+| `W` | 输出投影权重 | `[V,D]` |
+| `Y` | 与 hidden states 对齐后的标签 | `[B,S]` |
+| `Z` | 所有 token 对所有词表项的 logits | `[B,S,V]` |
 
-其中：
+为了避免把 hidden states 张量 `H` 和 hidden size 混在一起，本文用 `D` 表示 hidden size。
 
-- `B`：micro batch size；
-- `S`：序列长度；
-- `H`：hidden size；
-- `V`：词表大小。
+### 2.2 Qwen3.5 35B 实例参数
 
-多模态大模型常同时具有长序列和大词表。完整 logits 的元素数是 `B × S × V`，其显存随序列长度和词表大小线性增长，通常远大于 `[B,S,H]` 的隐藏状态。交叉熵还可能产生 FP32 logits、softmax 中间量和反向所需状态，因此 loss 阶段会形成明显的显存尖峰；动态 shape 下，反复申请大块张量也容易加剧碎片化。
+本次实例确认到的关键值如下：
 
-以仓库单元测试中的一组形状为例：`B=2`、`S=8192`、`V=151674`。仅 BF16 完整 logits 就约为：
+| 参数 | 数值 | 含义 |
+|---|---:|---|
+| NPU 数量 | 8 | 一次训练使用 8 个 rank |
+| `micro_batch_size` | 4 | 每个 rank 的本地 batch size，即 `B=4` |
+| global batch size | 32 | `4 × 8`；它不是单个 rank 上 loss 张量的 `B` |
+| `cutoff_len` | 16384 | 预处理允许的最大序列长度，不代表每个 batch 都达到该长度 |
+| `D` | 2048 | 文本 hidden size |
+| `V` | 248320 | 词表大小 |
+| `C` | 512 | 每个样本在一个 loss 块中的最大 token 数 |
+| hidden/weight dtype | BF16 | 实际运行探针观测到的输入和权重类型 |
 
-$$
-2 \times 8192 \times 151674 \times 2\ \mathrm{bytes}
-\approx 4.63\ \mathrm{GiB}
-$$
-
-式中最后的 `2 bytes` 表示一个 BF16 元素占 2 字节，`GiB` 是二进制容量单位，`1 GiB = 2^30 bytes`。因此元素总数为
-`2 × 8192 × 151674 = 2,485,846,016`，乘以 2 bytes 后再除以 `2^30`，得到约 `4.63 GiB`。
-
-这还没有计入 FP32 转换和交叉熵内部临时张量。
-
-ChunkLoss 的核心目标不是改变损失函数，而是避免在同一时刻物化整个 `[B,S,V]` logits。
-
-## 2. 为什么可以分块
-
-语言模型交叉熵在 token 维度上可加：
+输出投影权重的形状为 `[248320,2048]`，共有：
 
 $$
-L = \frac{1}{\alpha}\sum_t \mathrm{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
+248320 \times 2048 = 508559360
 $$
 
-这里各符号的含义是：
-
-- `L`：完成归一化后的总 loss；`t`：token 位置索引；
-- `h_t`：第 `t` 个 token 的隐藏向量，含 `H` 个实数；`W`：形状为 `[V,H]` 的 lm_head 权重；
-- `W^T`：`W` 的转置，`h_t W^T` 是长度为 `V` 的向量，表示该 token 对词表中 `V` 个类别的 logits；
-- `y_t`：正确类别在词表中的整数下标；`CE`：交叉熵；`α`：由 loss 类型决定的归一化系数，例如有效 token 总数；
-- `sum_t`：把所有有效 token 的损失相加，ignore token 不参与求和。
-
-交叉熵衡量预测概率与正确类别之间的差异。对单个 token，若 logits 为
-`z=[2,1,0]`、正确类别 `y=0`，则先用 softmax 得到
-`p_j = exp(z_j) / sum_k(exp(z_k)) ≈ [0.665,0.245,0.090]`，再计算
-`CE(z,y) = -log(p_y) ≈ 0.408`。正确类别的预测概率越接近 1，交叉熵越接近 0。
-
-把序列划分为若干互不重叠的块 `C_i` 后：
+个参数。仅按 BF16 计算，这个权重约占：
 
 $$
-L = \frac{1}{\alpha}\sum_i\sum_{t\in C_i}
-\mathrm{CE}\!\left(h_t W^{\mathsf T}, y_t\right)
+\frac{508559360 \times 2}{2^{30}}
+=0.9473\ \mathrm{GiB}
 $$
 
-式中 `i` 是块编号，`C_i` 是第 `i` 个块包含的 token 位置集合，`t in C_i` 表示位置 `t` 属于该块。各 `C_i` 互不重叠且并集覆盖全部待计算位置。例如 4 个 token 可分为
-`C_0={0,1}`、`C_1={2,3}`；若逐 token loss 为 `[0.2,0.4,0.3,0.1]`、`α=4`，则
-`L=((0.2+0.4)+(0.3+0.1))/4=0.25`，与不分块直接求平均相同。
+ChunkLoss 不会缩小 `W`，它优化的是随 `B` 和 `S` 增长的 logits 及其临时状态。
 
-只要所有块使用与原始 loss 一致的：
+## 3. 普通 loss 为什么容易形成显存峰值
 
-- label shift；
-- `ignore_index` 掩码；
-- 归约方式；
-- 归一化系数 `α`；
+### 3.1 从 hidden states 到 logits
 
-逐块 loss 的和就与一次性计算完整 loss 等价。梯度同样满足可加性：
+把前两个维度展平，令 token 总数 `N=B×S`：
+
+| 步骤 | 张量 | 形状 |
+|---|---|---|
+| 主干输出 | `H` | `[B,S,D]` |
+| 展平 | `X` | `[N,D]` |
+| 输出投影 | `Z=XWᵀ` | `[N,V]` |
+| 恢复 batch 视角 | `Z` | `[B,S,V]` |
+
+矩阵乘法为：
 
 $$
-\frac{\partial L}{\partial H}
-= \mathrm{concat}_{i}\!\left(\frac{\partial L_i}{\partial H_i}\right),
-\qquad
+Z=XW^{\mathsf T}
+$$
+
+其中 `X` 的形状是 `[N,D]`，`Wᵀ` 的形状是 `[D,V]`，所以结果 `Z` 的形状是 `[N,V]`。
+
+对 Qwen3.5 35B，`V/D=248320/2048=121.25`。在元素类型相同的前提下，logits 的元素数是 hidden states 的 121.25 倍。
+
+### 3.2 达到序列上限时有多大
+
+假设一个 rank 上真的出现 `B=4`、`S=16384` 的 batch：
+
+| 张量 | 形状 | 元素数 |
+|---|---|---:|
+| hidden states | `[4,16384,2048]` | 134217728 |
+| labels | `[4,16384]` | 65536 |
+| 完整 logits | `[4,16384,248320]` | 16273899520 |
+
+完整 logits 的理论容量为：
+
+$$
+M_{\mathrm{logits}}=B\times S\times V\times b
+$$
+
+式中 `b` 表示每个元素的字节数。若 logits 是 BF16，`b=2`：
+
+$$
+\frac{4\times16384\times248320\times2}{2^{30}}
+=30.3125\ \mathrm{GiB}
+$$
+
+若交叉熵前将 logits 转为 FP32，`b=4`：
+
+$$
+\frac{4\times16384\times248320\times4}{2^{30}}
+=60.625\ \mathrm{GiB}
+$$
+
+这里只计算一个 logits 张量，没有计入 softmax、交叉熵、反向传播所需的其他状态。相比之下，同一组形状的 BF16 hidden states 只有：
+
+$$
+\frac{4\times16384\times2048\times2}{2^{30}}
+=0.25\ \mathrm{GiB}
+$$
+
+所以 loss 阶段的问题不是标量 loss 本身，而是为了得到它而产生的巨大 `[B,S,V]` 中间张量。
+
+## 4. 交叉熵为什么允许沿 token 分块
+
+### 4.1 单个 token 的 loss
+
+对第 `t` 个有效 token，它的 logits 是长度为 `V` 的向量 `z_t`，正确类别下标是 `y_t`。交叉熵可以写成：
+
+$$
+\ell_t
+=-z_{t,y_t}
++\log\left(\sum_{j=0}^{V-1}\exp(z_{t,j})\right)
+$$
+
+例如 `z_t=[2,1,0]`，正确类别为 0。softmax 后正确类别概率约为 0.665，因此：
+
+$$
+\ell_t=-\log(0.665)\approx0.408
+$$
+
+一个 token 的交叉熵只依赖该 token 自己的 logits 和标签，不依赖同一 batch 中其他 token 的 logits。
+
+### 4.2 一个 batch 的 loss 是逐 token 求和再归一化
+
+令 `I` 为所有有效标签位置的集合，`M` 为有效 token 数。默认平均 loss 为：
+
+$$
+L=\frac{1}{M}\sum_{t\in\mathcal I}\ell_t
+$$
+
+如果把 `I` 拆成互不重叠的 `K` 个块，每个有效位置只属于一个块，那么：
+
+$$
+L
+=\frac{1}{M}
+\sum_{i=0}^{K-1}
+\sum_{t\in\mathcal I_i}\ell_t
+$$
+
+这只是改变求和顺序，没有改变任何 token 的 logits、标签、权重或总归一化因子 `M`。
+
+假设四个有效 token 的 loss 分别为 `[0.2,0.4,0.3,0.1]`，分成前两个和后两个两块：
+
+$$
+L
+=\frac{(0.2+0.4)+(0.3+0.1)}{4}
+=0.25
+$$
+
+一次性相加同样得到 `(0.2+0.4+0.3+0.1)/4=0.25`。
+
+这里有一个关键条件：`M` 必须按整个 batch 统计，不能在每个块内各自求平均后再直接相加。否则较短块会被错误地赋予与较长块相同的权重。
+
+## 5. ChunkLoss 怎样切分张量
+
+### 5.1 沿序列维切，而不是沿 hidden 维或词表维切
+
+设每块的最大序列长度为 `C`，块数为：
+
+$$
+K=\left\lceil\frac{S}{C}\right\rceil
+$$
+
+第 `i` 块实际长度记为 `C_i`。除最后一块外通常有 `C_i=C`；最后一块取剩余 token，所以可能小于 `C`。
+
+每块的形状变化如下：
+
+| 阶段 | 形状 |
+|---|---|
+| hidden 块 `H_i` | `[B,C_i,D]` |
+| 展平 hidden `X_i` | `[B×C_i,D]` |
+| 标签块 `Y_i` | `[B,C_i]`，展平后为 `[B×C_i]` |
+| 当前块 logits `Z_i` | `[B×C_i,V]` |
+| 当前块逐 token loss | `[B×C_i]` |
+| 当前块归约结果 | 标量 |
+
+词表仍然完整保留，因为每个 token 的交叉熵必须比较全部 `V` 个类别。ChunkLoss 缩小的是同一时刻参与投影的 token 数。
+
+### 5.2 Qwen3.5 35B 的满块
+
+本例 `B=4`、`C=512`、`D=2048`、`V=248320`。一个满块经历：
+
+```text
+hidden block     [4,512,2048]
+    ↓ 展平 B 和 C
+hidden matrix    [2048,2048]
+    × weightᵀ    [2048,248320]
+    ↓
+logits block     [2048,248320]
+labels block     [4,512] -> [2048]
+    ↓ 逐 token 交叉熵并按整个 batch 的有效 token 数归一化
+chunk loss       scalar
+```
+
+满块 logits 有 `508559360` 个元素，容量约为：
+
+| dtype | 单个满块 logits |
+|---|---:|
+| BF16 | 0.9473 GiB |
+| FP32 | 1.8945 GiB |
+
+这也是为什么 `C` 的选择直接影响 loss 阶段峰值：`C` 减半，单块 logits 的元素数也近似减半。
+
+### 5.3 达到 16384 上限时
+
+因为 `16384/512=32`，序列可以整齐地分为 32 块：
+
+```text
+完整 hidden states: [4,16384,2048]
+
+chunk 0:  [4,512,2048] -> logits [2048,248320]
+chunk 1:  [4,512,2048] -> logits [2048,248320]
+...
+chunk 31: [4,512,2048] -> logits [2048,248320]
+```
+
+只看 logits，FP32 理论容量从完整张量的 60.625 GiB 降到单个满块的约 1.8945 GiB，比例为 32 倍。这里说的是 logits 这一项的理论缩减，不等于训练总峰值也必然缩减 32 倍，因为参数、hidden states、梯度及其他网络状态仍然存在。
+
+### 5.4 最后一块不足 512 时
+
+若 `S=576`：
+
+$$
+K=\left\lceil\frac{576}{512}\right\rceil=2
+$$
+
+形状为：
+
+| 块 | hidden | 展平 hidden | logits | labels |
+|---|---|---|---|---|
+| 第 0 块 | `[4,512,2048]` | `[2048,2048]` | `[2048,248320]` | `[4,512]` |
+| 第 1 块 | `[4,64,2048]` | `[256,2048]` | `[256,248320]` | `[4,64]` |
+
+第二块只计算实际存在的 64 个 token，不需要补成 512。它的 FP32 logits 约为 0.2368 GiB。
+
+## 6. 真实首步 shape：为什么不能把上限当成实际长度
+
+`cutoff_len=16384` 只是样本截断上限。实际数据经过动态 padding 后，每个 rank 的首个 batch 有不同的 `S`。运行探针观测结果如下：
+
+| rank | hidden states | 分块长度 |
+|---:|---|---|
+| 0 | `[4,504,2048]` | 504 |
+| 1 | `[4,536,2048]` | 512 + 24 |
+| 2 | `[4,496,2048]` | 496 |
+| 3 | `[4,576,2048]` | 512 + 64 |
+| 4 | `[4,592,2048]` | 512 + 80 |
+| 5 | `[4,576,2048]` | 512 + 64 |
+| 6 | `[4,552,2048]` | 512 + 40 |
+| 7 | `[4,592,2048]` | 512 + 80 |
+
+所有 rank 上都确认：
+
+- hidden states 为 BF16；
+- 输出权重为 BF16，形状 `[248320,2048]`；
+- bias 不存在；
+- `B=4`；
+- 标签块与 hidden 块在前两个维度严格对齐。
+
+以 rank 0 为例，`S=504` 小于 `C=512`，所以只有一个块。此时 ChunkLoss 不会从 token 分块中获得峰值缩减，完整 FP32 logits 理论容量约为 1.8649 GiB。
+
+以 rank 5 为例，`S=576`，完整 FP32 logits 理论容量约为 2.1313 GiB，最大块为 1.8945 GiB，缩减比例只有 `576/512=1.125` 倍。
+
+因此本实例中：
+
+- 对当前首步的短序列，ChunkLoss 的收益有限；
+- 随 `S` 增大，块数增加，收益逐渐明显；
+- 到 `S=16384` 时，单看 logits 才达到理论上的 32 倍缩减。
+
+这说明评估 ChunkLoss 不能只看 `cutoff_len`，还必须看训练数据实际产生的序列长度分布。
+
+## 7. 标签为什么要移位，忽略位置怎样处理
+
+### 7.1 next-token prediction 的对齐关系
+
+自回归训练中，位置 `t` 的 hidden state 用来预测位置 `t+1` 的 token。假设原始 token 是：
+
+```text
+input:  [A, B, C, D]
+target: [B, C, D, ignore]
+```
+
+因此 hidden states 和移位后标签仍然都是 `[B,S,...]` 的长度；最后一个位置没有下一个 token，标签设为忽略值。
+
+多模态监督微调还会把用户提示、视觉占位符、padding 等不参与监督的位置标为忽略值。这些位置仍可参与主干网络上下文计算，但不贡献语言模型交叉熵。
+
+### 7.2 分块时 hidden 和 labels 必须使用相同边界
+
+如果 hidden states 的第 0 块覆盖序列位置 0 到 511，那么标签第 0 块也必须覆盖完全相同的位置。否则某个位置的预测会与别的位置标签比较，loss 将失去语义。
+
+忽略位置的逐 token loss 和 logits 梯度都按 0 处理。有效 token 总数 `M` 在切块前按整个 batch 统计，所以一个块中即使大部分位置被忽略，也不会改变其他块的权重。
+
+## 8. 为什么分块后的梯度也与完整计算相同
+
+### 8.1 对 hidden states 的梯度
+
+不同 token 的 hidden states 位于不同的行。第 `i` 块只产生自己位置的 hidden 梯度 `dX_i`，最后按原序列顺序拼回：
+
+$$
+\frac{\partial L}{\partial X}
+=\mathrm{concat}
+\left(
+\frac{\partial L}{\partial X_0},
+\frac{\partial L}{\partial X_1},
+\ldots,
+\frac{\partial L}{\partial X_{K-1}}
+\right)
+$$
+
+因为每个 token 只属于一个块，不会出现同一 hidden 行需要跨块相加的问题。
+
+### 8.2 对输出权重的梯度
+
+所有块共用同一个 `W`。每块产生一份形状 `[V,D]` 的权重梯度，完整梯度是逐元素相加：
+
+$$
 \frac{\partial L}{\partial W}
-= \sum_i\frac{\partial L_i}{\partial W}
+=\sum_{i=0}^{K-1}
+\frac{\partial L_i}{\partial W}
 $$
 
-`L_i` 表示第 `i` 块尚未与其他块合并的损失；`H_i` 是该块的 hidden states，`H` 是完整 hidden states。`∂L/∂H` 和 `∂L/∂W` 分别表示 loss 对 hidden states、权重的梯度，即输入或参数发生微小变化时 loss 的变化率。`concat_i` 表示按原序列位置拼接：各 token 只属于一个块，所以 hidden 梯度放回各自位置；`sum_i` 表示逐元素相加：所有块共用同一个 `W`，所以其参数梯度需要累加。例如两块给同一权重元素的梯度分别为 `0.3` 和 `-0.1`，完整梯度就是 `0.3+(-0.1)=0.2`。
+例如某个权重元素从两个块分别得到 `0.3` 和 `-0.1`，累加结果为 `0.2`，与把两个块一次性放进同一矩阵计算得到的结果一致。
 
-因此可以让每个块的 logits 在计算完 loss 和梯度后立即释放，只保留最终标量和必要梯度。
+### 8.3 从 softmax 梯度看形状
 
-## 3. 传统 ChunkLoss 的工作方式
-
-假设固定 `chunk_size` 为 `C`，传统实现沿序列维 `dim=1` 切分：
-
-| 分块 | hidden states | logits | loss |
-|---|---|---|---|
-| chunk `i` | `[B,C,H]` | `[B,C,V]` | `L_i` |
-| 全部 chunk | 按序列维拼接 | 按序列维拼接 | `L = sum(L_i)` |
-
-任意时刻只需持有一个 `[B,C,V]` logits。仅考虑 logits，理想峰值约从 `B × S × V` 降为 `B × C × V`，降幅近似为 `S/C`。
-
-MindSpeed-MM 的实现不是简单地在普通 forward 后等待统一 backward，而是在自定义 `torch.autograd.Function` 的 forward 内，对每个块调用 `torch.func.grad_and_value`，同时得到：
-
-- 当前块的 loss；
-- 当前块对 hidden states 的梯度；
-- 当前块对 `lm_head.weight` 的梯度。
-
-随后它把 hidden 梯度写入预分配的 `[B,S,H]` 张量，把各块 weight 梯度累加到 `[V,H]` 张量。自定义 backward 不再重新执行 lm_head 和交叉熵，只把 forward 中保存的梯度乘以上游 `grad_output` 后返回。
-
-这意味着传统实现的显存收益主要来自“不保留完整 logits 及其计算图”，并不意味着 loss 阶段没有额外内存：它仍需保留 hidden 梯度、weight 梯度和单块 logits。
-
-## 4. 静态分块与动态分块
-
-### 4.1 静态分块
-
-静态模式直接使用配置中的 `chunk_size`：
-
-```yaml
-features:
-  loss_cfg:
-    loss_type: default
-  enable_chunk_loss: true
-  enable_dynamic_chunk_loss: false
-  chunkloss_plan:
-    apply_module: lm_head
-    impl_type: legacy
-    chunk_size: 1024
-```
-
-传统实现中，`chunk_size` 表示每个样本在序列维上的 token 数；若记 `C=chunk_size`，单块 token 总数近似为 `B × C`。
-
-### 4.2 动态分块
-
-动态模式配置单次计算允许的总 token 上限 `T=total_chunk_size`。运行时根据当前 batch size 计算：
+对一个块，令 `G_i` 是 loss 对 logits 的梯度，形状为 `[B×C_i,V]`。忽略归一化系数时，每个有效 token 行满足：
 
 $$
-C_{\max}=\left\lfloor\frac{T}{B}\right\rfloor,
-\qquad
-C=2^{\left\lfloor\log_2 C_{\max}\right\rfloor}
-\quad (C\le C_{\max})
+G_i=\mathrm{softmax}(Z_i)-\mathrm{onehot}(Y_i)
 $$
 
-式中 `T` 是一次分块允许的总 token 上限，`B` 是当前 batch size，`C_max` 是理论上每个样本最多可放入的 token 数，`C` 是最终采用的 `chunk_size`。`floor(x)` 是向下取整，例如 `floor(3.7)=3`；`log2(x)` 表示“2 的多少次方等于 `x`”。第二步因此是在不超过 `C_max` 的前提下取最大的 2 的整数次幂。例如 `T=4096`、`B=3` 时，`C_max=floor(4096/3)=1365`；因为 `2^10=1024 <= 1365 < 2048=2^11`，所以 `C=1024`。
+于是：
 
-例如 `T=4096`：
+$$
+\frac{\partial L_i}{\partial X_i}=G_iW
+$$
 
-| Batch size | 理论上限 `floor(T/B)` | 实际 `chunk_size` |
-|---:|---:|---:|
-| 1 | 4096 | 4096 |
-| 2 | 2048 | 2048 |
-| 3 | 1365 | 1024 |
-| 8 | 512 | 512 |
+$$
+\frac{\partial L_i}{\partial W}=G_i^{\mathsf T}X_i
+$$
 
-当参数无效，或 `B >= T` 时，代码退化为 `chunk_size=1`。动态模式适合 batch size 或输入 shape 经常变化的场景，可让不同 batch 的单块工作量更稳定。
+形状检查如下：
 
-```yaml
-features:
-  loss_cfg:
-    loss_type: default
-  enable_chunk_loss: false
-  enable_dynamic_chunk_loss: true
-  chunkloss_plan:
-    apply_module: lm_head
-    impl_type: legacy
-    total_chunk_size: 4096
-```
-
-静态开关与动态开关应二选一。
-
-## 5. 三种 loss 语义如何保持不变
-
-原生 FSDP2 的预置 loss 支持以下归约方式：
-
-| `loss_type` | 归一化含义 | 传统 ChunkLoss |
+| 计算 | 输入形状 | 输出形状 |
 |---|---|---|
-| `default` | 当前 batch 所有有效 token 的平均 loss | 支持 |
-| `per_sample_loss` | 每个样本先按自己的有效 token 数平均，再对样本平均 | 支持，也处理 data packing 的 `cu_seqlens` |
-| `per_token_loss` | 按一个训练 step 的平均有效 token 数归一化 | 支持；要求 `PrefetchGradAccDataLoader` 提供统计量 |
+| `G_i W` | `[B×C_i,V] × [V,D]` | `[B×C_i,D]` |
+| `G_iᵀ X_i` | `[V,B×C_i] × [B×C_i,D]` | `[V,D]` |
 
-代码先完成 next-token label shift：在 labels 右侧补一个 `-100`，再取 `labels[..., 1:]`。这样 hidden position `t` 对应原始 label `t+1`，最后一个位置被忽略。之后根据 loss 类型计算全局或逐样本归一化系数 `α`，再把 labels 和必要的逐 token `α` 与 hidden states 按相同边界切块。
+这正好分别对应 hidden 梯度和输出权重梯度。
 
-关键点是 `α` 按完整 batch/step 的语义生成，而不是每个 chunk 各自重新统计。因此 chunk 边界不会改变 loss 权重。
+## 9. 为什么必须及时完成每块的梯度计算
 
-## 6. CCE：同时沿词表维流式计算
+如果只是把 forward 写成循环，却把所有块的计算图一直保留到最后统一 backward，那么虽然某一时刻没有完整 `[B,S,V]`，多个块的反向状态仍可能同时驻留，显存收益会被削弱。
 
-当前代码还提供 `impl_type: cce`。它源自 Cut Cross Entropy 思路，针对传统 ChunkLoss 仍需生成 `[块内 token 数,V]` logits 的问题，再沿词表维切成大小为 `vocab_tile_size` 的 tile。
+ChunkLoss 的完整原则是：
 
-### 6.1 前向
+1. 取出一个 hidden/label 块；
+2. 生成该块 logits；
+3. 计算该块 loss；
+4. 立即得到该块的 hidden 梯度和权重梯度；
+5. 保存 hidden 梯度到对应序列位置，累加权重梯度；
+6. 释放该块 logits 和临时状态；
+7. 再处理下一块。
 
-对每个词表区间 `[v0:v1]`：
+最终只需保留完整形状的 hidden 梯度、累计后的权重梯度以及标量 loss，而不需要同时保留所有 token 的词表 logits。
 
-1. 计算局部 logits：`tile = H W[v0:v1]^T`；
-2. 用 online log-sum-exp 合并当前 tile 的最大值与指数和；
-3. 如果正确类别落在当前 tile，提取对应 logit；
-4. 复用轮转 tile buffer，不生成完整 `[N,V]` logits。
+## 10. 显存收益怎样估算
 
-所有 tile 扫描完成后：
-
-$$
-\mathrm{CE}_{t}
-=\mathrm{logsumexp}\!\left(\mathrm{logits}_{t}\right)
--\mathrm{logit}_{t,\,y_t}
-$$
-
-`logits_t` 是 token `t` 的全部词表 logits，是长度为 `V` 的向量；`logit_(t,y_t)` 是其中正确类别的那一个。`logsumexp` 定义为
-`logsumexp(z) = log(sum_j(exp(z_j)))`。它把“先指数、求和、再取对数”写成一个可数值稳定实现的运算；实践中会先减去最大值，避免 `exp(z_j)` 溢出。仍以 `z=[2,1,0]`、`y=0` 为例，
-`logsumexp(z) ≈ 2.408`，所以 `CE=2.408-2=0.408`，与前面的 softmax 计算一致。CCE 只改变这个量的流式计算方式，不改变交叉熵定义。
-
-忽略位置贡献 0，最后对 token 求和。
-
-### 6.2 反向
-
-CCE 前向只保存 hidden states、head weight、labels 和每个 token 的 `logsumexp`。反向再次逐 tile 重算 logits，然后计算：
+只考虑 logits，普通计算的理论容量是：
 
 $$
-G=\mathrm{softmax}\!\left(\mathrm{logits}\right)-\mathrm{onehot}\!\left(\mathrm{labels}\right),
-\qquad
-dH=GW,
-\qquad
-dW=G^{\mathsf T}H
+M_{\mathrm{full}}=B\times S\times V\times b
 $$
 
-这里公式中的大写 `H` 表示 hidden states 矩阵，不是前文单独表示 hidden size 的 `H`。为消除形状书写中的歧义，暂用 `D` 表示 hidden size，则参与计算的 token 展平后有：`H: [N,D]`、`W: [V,D]`、`G: [N,V]`。`N` 是 token 数，`G` 是 loss 对 logits 的梯度；`onehot(labels)` 把每个整数标签变成只有正确类别为 1、其余为 0 的向量。`dH`、`dW` 分别是对 hidden states 和 lm_head 权重的梯度，`G^T` 是 `G` 的转置。
+ChunkLoss 的单块理论容量近似是：
 
-例如 logits 为 `[2,1,0]`、label 为 0 时，softmax 约为 `[0.665,0.245,0.090]`，one-hot 向量为 `[1,0,0]`，所以
-`G ≈ [-0.335,0.245,0.090]`。这表示提高正确类别 logit 会降低 loss，而提高错误类别 logit 会增大 loss。随后按矩阵乘法计算 `GW`，即可把这三个类别方向上的影响传回 hidden states；计算 `G^T H`，则把同一权重在所有 token 上的贡献累加起来。
+$$
+M_{\mathrm{chunk}}
+=B\times\min(C,S)\times V\times b
+$$
 
-`G` 也只在 tile 范围内存在。实现用两个设备 stream 分别承载矩阵乘和向量 kernel，并以 3 个轮转 buffer 和 event 建立依赖，重叠相邻 tile 的计算。
+当 `S` 大于 `C` 时，logits 部分的理论缩减比例约为：
 
-### 6.3 配置与限制
+$$
+R
+=\frac{M_{\mathrm{full}}}{M_{\mathrm{chunk}}}
+=\frac{S}{C}
+$$
 
-```yaml
-features:
-  loss_cfg:
-    loss_type: default
-  enable_chunk_loss: true
-  enable_dynamic_chunk_loss: false
-  chunkloss_plan:
-    apply_module: lm_head
-    impl_type: cce
-    vocab_tile_size: 4096
-    chunk_size: null
-```
+这个估算有四个边界：
 
-- CCE 当前只支持 `default` 和 `per_token_loss`，不支持 `per_sample_loss`。
-- CCE 与动态 ChunkLoss 互斥。
-- `vocab_tile_size` 默认 4096；增大它可减少 tile 和 event 数，但会增大轮转 buffer。
-- CCE 下的 `chunk_size` 是可选的外层 token 分段大小。实现先把 `[B,S,H]` 展平为 `[N,H]`，因此这里按展平 token 数切段，不再是传统实现中“每个样本的序列长度”。
-- CCE kernel 依赖 Triton/Ascend 环境，但采用延迟导入；未启用 CCE 时不会因缺少 Triton 而影响普通训练代码导入。
+1. 它只计算 logits，不是完整训练显存；
+2. hidden 梯度 `[B,S,D]` 和权重梯度 `[V,D]` 仍需要存在；
+3. 交叉熵和矩阵乘可能有额外 workspace；
+4. `S` 不超过 `C` 时只有一个块，理论比例为 1。
 
-## 7. 如何选择参数
+因此应使用真实序列长度分布估算，而不是只代入最大长度。
 
-建议从传统静态 ChunkLoss 和 `chunk_size=1024` 开始，这是当前入口文档和样例配置的默认方向。
+## 11. `chunk_size` 的时间—显存权衡
 
-- 仍然 OOM：逐步减小 `chunk_size`，如 `1024 -> 512 -> 256`。
-- batch size 经常变化：考虑动态模式，用 `total_chunk_size` 约束 `B × chunk_size`。
-- 词表特别大，传统分块后单块 logits 仍是主要峰值：在满足 NPU/Triton 和 loss 类型限制时评估 CCE。
-- 吞吐下降明显：适当增大 chunk；块越小，循环、kernel launch 和重复调度开销越多。
-- CCE 调优：先用 `vocab_tile_size=4096`；显存允许且 host/event 开销突出时再评估 8192。
+`C` 越小：
 
-参数没有脱离模型形状和训练并行配置的通用最优值。应同时观察峰值显存、step time、loss 曲线和梯度稳定性。
+- 单块 logits 越小，峰值显存越低；
+- 块数 `K` 越多；
+- 循环调度、矩阵乘启动、梯度累加次数越多；
+- 小矩阵更可能降低设备利用率，训练时间可能增加。
 
-## 8. 明确的使用边界
+`C` 越大：
 
-- 当前仓库文档将 ChunkLoss 定位为 FSDP2 特性；原生 FSDP2 是推荐路径，Megatron-FSDP2 是过渡路径。
-- 原生 FSDP2 使用 ChunkLoss 时，`features.loss_cfg.loss_type` 不能保持 `raw`；训练引擎在 `raw` 时不会注入预置 loss 函数。
-- 被替换的目标模块必须唯一匹配，并且必须是 `torch.nn.Linear`。
-- 传统实现和 CCE 都不支持带 bias 的 lm_head；传入 bias 会抛出 `NotImplementedError`。
-- ChunkLoss 优化的是输出投影与交叉熵阶段，不会减少 transformer 主干本身的激活、参数或优化器状态。
-- 数学上等价不代表浮点结果逐 bit 相同。分块改变了归约顺序，合理预期是容差范围内一致。
+- 块数更少，计算更接近一次大矩阵乘；
+- 单块 logits 更大，显存收益下降；
+- 当 `C` 不小于实际 `S` 时，等价于没有进行 token 分块。
 
-## 9. 阅读下一篇
+所以 `chunk_size` 不是越小越好。合理选择方式是：先根据设备可承受的 loss 阶段峰值确定上限，再在不超显存的候选值中选择吞吐更好的值。
 
-具体配置如何进入训练引擎、`lm_head` 如何被替换、自定义 autograd 如何保存梯度，以及各模型如何调用 loss，请继续阅读 [MindSpeed-MM ChunkLoss 源码实现](./implementation.md)。
+对本例，`C=512` 的含义是每个 rank、每个样本每次最多处理 512 个序列位置；一个满块实际同时处理 `B×C=2048` 个 token。
+
+## 12. ChunkLoss 改变了什么，没有改变什么
+
+ChunkLoss 改变的是：
+
+- logits 的物化粒度；
+- loss 和局部梯度的计算顺序；
+- 显存峰值与矩阵调度次数之间的权衡。
+
+ChunkLoss 不改变的是：
+
+- 输出投影权重 `W`；
+- 每个 token 与全部词表类别的比较；
+- next-token 标签对齐关系；
+- 忽略位置；
+- 整个 batch 的 loss 归一化语义；
+- 最终 hidden 梯度和权重梯度；
+- transformer 主干的参数、激活和优化器状态。
+
+一句话概括：ChunkLoss 用“按序列分块、逐块完成 loss 与梯度、及时释放大 logits”的顺序重排，换取更低的 loss 阶段显存峰值；只要标签边界、忽略掩码和全局归一化保持一致，它与完整 logits 计算具有相同的 loss 和梯度。

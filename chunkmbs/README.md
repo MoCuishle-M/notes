@@ -301,9 +301,7 @@ $$
 反向时，`cat` 的上游梯度先按原边界拆回每个 chunk。所有 chunk 使用同一参数 `W`，因此参数梯度由 autograd 相加：
 
 $$
-\frac{\partial L}{\partial W}
-=
-\sum_{i=0}^{K-1}
+\frac{\partial L}{\partial W}=\sum_{i=0}^{K-1}
 \frac{\partial L}{\partial F(X_i;W)}
 \frac{\partial F(X_i;W)}{\partial W}
 $$
